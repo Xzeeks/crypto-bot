@@ -1,0 +1,15 @@
+[Unit]
+Description=Polymarket crypto ladder order-book logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/crypto-bot
+ExecStart=/root/crypto-bot/.venv/bin/python /root/crypto-bot/logger/book_logger.py --db /root/crypto-bot/data/books.sqlite --assets ethereum,bitcoin --interval 120
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
