@@ -140,6 +140,15 @@ def tick(con, assets, now):
         for family, event_date, direction, strike, yes_token, rts in rows:
             try:
                 bids, asks = fetch_book(yes_token)
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    # touch barrier already hit (Polymarket resolves immediately and pulls the book) -> stop polling, note when
+                    con.execute("UPDATE markets SET resolve_ts=?, last_seen=? WHERE family=? AND asset=? AND event_date=? AND direction=? AND strike=?",
+                                (now - 7200, now, family, asset, event_date, direction, strike))   # drops out of the poll set at once; last_seen = hit time
+                    log.info("resolved early (404): %s %s %s %s%s", family, asset, event_date, direction, strike)
+                else:
+                    log.warning("book %s %s %s %s%s: %s", family, asset, event_date, direction, strike, e)
+                continue
             except Exception as e:
                 log.warning("book %s %s %s %s%s: %s", family, asset, event_date, direction, strike, e); continue
             bb, bbs = (bids[0] if bids else (None, None)); ba, bas = (asks[0] if asks else (None, None))
