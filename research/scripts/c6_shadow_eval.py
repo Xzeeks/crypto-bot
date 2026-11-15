@@ -31,7 +31,7 @@ ap.add_argument("--fills", default=None, help="duckdb from c1 pull, for resolved
 a = ap.parse_args()
 
 con = sqlite3.connect(a.db)
-b = pd.read_sql("SELECT * FROM books WHERE asset=? AND spot IS NOT NULL", con, params=(a.asset,))
+b = pd.read_sql("SELECT * FROM books WHERE family='above' AND asset=? AND spot IS NOT NULL", con, params=(a.asset,))
 if b.empty: raise SystemExit("no books logged yet for " + a.asset)
 b["hours"] = (b.resolve_ts - b.ts) / 3600
 b["pct"] = (b.spot - b.strike) / b.strike * 100           # positive = spot above strike = we want Yes
