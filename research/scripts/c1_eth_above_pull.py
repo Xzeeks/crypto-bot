@@ -102,20 +102,32 @@ def parse_markets(ev, d):
 
 
 def fetch_fills(condition_id, page=1000, max_pages=400):
-    out, offset = [], 0
+    """Data API v2 (v1 retired 2026-11-02): /v2/trades?condition=...&taker_only=true, cursor-paged, {"data":[...]} envelope."""
+    out, cursor = [], None
     for _ in range(max_pages):
-        batch = get(f"{DATA}/trades", {"market": condition_id, "limit": page, "offset": offset, "takerOnly": "true"})
+        params = {"condition": condition_id, "limit": page, "taker_only": "true", "start": 1}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            r = get(f"{DATA}/v2/trades", params)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                break
+            raise
+        batch = r.get("data", r) if isinstance(r, dict) else r
         if not batch:
             break
         for t in batch:
             out.append(dict(
                 condition_id=condition_id, ts=int(t["timestamp"]), price=float(t["price"]), size=float(t["size"]),
-                side=t.get("side"), token=t.get("asset"), outcome_label=t.get("outcome"),
-                outcome_index=t.get("outcomeIndex"), wallet=t.get("proxyWallet"), tx=t.get("transactionHash"),
+                side=t.get("side"), token=t.get("token_id") or t.get("asset"), outcome_label=t.get("outcome"),
+                outcome_index=t.get("outcome_index", t.get("outcomeIndex")),
+                wallet=t.get("proxy_wallet") or t.get("proxyWallet"), tx=t.get("transaction_hash") or t.get("transactionHash"),
             ))
-        if len(batch) < page:
+        pg = r.get("pagination", {}) if isinstance(r, dict) else {}
+        cursor = pg.get("next_cursor")
+        if not pg.get("has_more") or not cursor:
             break
-        offset += page
     return out
 
 

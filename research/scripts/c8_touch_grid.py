@@ -69,7 +69,7 @@ kl = con.execute("SELECT open_ts, high, low, close FROM klines ORDER BY open_ts"
 f = con.execute("""SELECT f.ts, f.price, f.size, f.token, f.side, m.event_date, m.direction, m.strike, m.window_start, m.window_end, m.outcome, m.yes_token
                    FROM fills f JOIN markets m USING (condition_id) WHERE m.outcome IS NOT NULL AND f.ts >= m.window_start AND f.ts < m.window_end""").df()
 if f.empty: raise SystemExit("no fills")
-f["minute"] = (f.ts // 60) * 60
+f["minute"] = (f.ts // 60) * 60; f["event_date"] = f.event_date.astype(str)
 f["spot"] = f.minute.map(kl.close); f = f.dropna(subset=["spot"])
 # already touched before the fill? (then NO is dead — exclude; you'd never sell it)
 def touched_before(r):

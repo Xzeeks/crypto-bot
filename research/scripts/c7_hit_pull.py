@@ -48,13 +48,23 @@ def iso_ts(s):
 
 
 def fetch_fills(cid, page=1000, max_pages=200):
-    out, off = [], 0
+    """Data API v2 (v1 retired 2026-11-02): /v2/trades?condition=...&taker_only=true, cursor-paged, {"data":[...]} envelope."""
+    out, cursor = [], None
     for _ in range(max_pages):
-        b = get(f"{DATA}/trades", {"market": cid, "limit": page, "offset": off, "takerOnly": "true"})
-        if not b: break
-        out += [(cid, int(t["timestamp"]), float(t["price"]), float(t["size"]), t.get("side"), t.get("asset"), t.get("outcome"), t.get("proxyWallet"), t.get("transactionHash")) for t in b]
-        if len(b) < page: break
-        off += page
+        params = {"condition": cid, "limit": page, "taker_only": "true", "start": 1}
+        if cursor: params["cursor"] = cursor
+        try:
+            r = get(f"{DATA}/v2/trades", params)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404: break
+            raise
+        rows = r.get("data", r) if isinstance(r, dict) else r
+        if not rows: break
+        out += [(cid, int(t["timestamp"]), float(t["price"]), float(t["size"]), t.get("side"), t.get("token_id") or t.get("asset"),
+                 t.get("outcome"), t.get("proxy_wallet") or t.get("proxyWallet"), t.get("transaction_hash") or t.get("transactionHash")) for t in rows]
+        pg = r.get("pagination", {}) if isinstance(r, dict) else {}
+        cursor = pg.get("next_cursor")
+        if not pg.get("has_more") or not cursor: break
     return out
 
 
