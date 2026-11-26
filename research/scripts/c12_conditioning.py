@@ -66,12 +66,13 @@ rows, feats = [], {}
 for D in alld:
     t0, t1 = mid(D), mid(D + timedelta(days=1)); day = k.loc[t0:t1 - 60]
     if len(day) < 1300 or np.isnan(rv30.get(D, np.nan)): continue
-    base = dict(dow=DOW[D.weekday()], wk="Sat/Sun" if D.weekday() >= 5 else "Mon-Fri", rv=rv_b(rv30[D]), trend="above 30d avg" if dc[D] >= ma30[D] else "below 30d avg")
     for cell, c in CELLS.items():
         te = noon(D - timedelta(days=1)) if cell == "carry" else t1 - c["left"] * 3600
-        if te not in k.index: continue
+        Dref = D - timedelta(days=1) if cell == "carry" else D        # vol regime and trend as known at the start of the ENTRY day (no look-ahead for carry)
+        if te not in k.index or np.isnan(rv30.get(Dref, np.nan)) or np.isnan(ma30.get(Dref, np.nan)): continue
         spot = k.close[te]; prev = k.close.get(te - 86400, np.nan)
-        ft = dict(base, r24=r24_b((spot / prev - 1) * 100 if prev == prev else np.nan))
+        ft = dict(dow=DOW[D.weekday()], wk="Sat/Sun" if D.weekday() >= 5 else "Mon-Fri", rv=rv_b(rv30[Dref]),
+                  trend="above 30d avg" if dc[Dref] >= ma30[Dref] else "below 30d avg", r24=r24_b((spot / prev - 1) * 100 if prev == prev else np.nan))
         if cell == "carry":
             fin = k.close.get(noon(D) - 60, np.nan)
             if fin != fin: continue
@@ -155,3 +156,30 @@ for cell, c in CELLS.items():
             out.append({"bucket": bkt, "days3y": x.D.nunique(), "rate3y%": round(rate, 2), "fdays": y.D.nunique() if len(y) else 0, "f_usd": round(y.usd.sum()) if len(y) else 0,
                         "implied%": None if imp != imp else round(imp, 2), "gap": None if imp != imp else round(imp - rate, 2), "real%": None if real != real else round(real, 2)})
         print(f"\n-- {title} --"); print(pd.DataFrame(out).to_string(index=False, na_rep=""))
+
+# ---------- filter v1 (fixed 2026-11-26) on the 3-year risk and on the whole fills history ----------
+def keep_v1(cell, r24, trend, dow):
+    if r24 is None: return False
+    if cell == "carry": return r24 not in ("fell >4%", "fell 2-4%") and trend == "above 30d avg"
+    if cell == "sellDn": return r24 not in ("fell >4%", "fell 2-4%")
+    if cell == "sellUp": return r24 in ("fell 2-4%", "flat ±2%")
+    return r24 in ("fell >4%", "rose >4%") and dow != "Sat"
+print(f"\n================ {a.asset}: filter v1 — carry: 24h move >= -2% and above the 30d average; sellDn: 24h move >= -2%; "
+      "sellUp: 24h move between -4% and +2%; buyT: |24h move| > 4% and not Saturday ================")
+R["keep"] = [keep_v1(c_, r_, t_, d_) for c_, r_, t_, d_ in zip(R.cell, R.r24, R.trend, R.dow)]
+if len(F): F["keep"] = [keep_v1(c_, r_, t_, d_) for c_, r_, t_, d_ in zip(F.cell, F.r24, F.trend, F.dow)]
+out = []
+for cell, c in CELLS.items():
+    for lab, kp in (("kept", True), ("skipped", False)):
+        x = R[(R.cell == cell) & (R.keep == kp)]; y = F[(F.cell == cell) & (F.keep == kp)] if len(F) else F
+        row = {"cell": cell, "set": lab, "days3y": x.D.nunique(), "rate3y%": round(x.ev.mean() * 100, 2) if len(x) else None}
+        if len(y):
+            win = (1 - y.ev) if c["sell"] else y.ev
+            pnl = y.usd / y.q * win - y.usd; dly = pnl.groupby(y.D).sum()
+            imp = ((1 - wavg(y.q, y.usd)) if c["sell"] else wavg(y.q, y.usd)) * 100
+            row.update({"fdays": y.D.nunique(), "f_usd": round(y.usd.sum()), "implied%": round(imp, 2), "gap": round(imp - x.ev.mean() * 100, 2) if len(x) else None,
+                        "fill_pnl": round(pnl.sum()), "fill_roi%": round(pnl.sum() / y.usd.sum() * 100, 2), "losing_days": int((dly < 0).sum()), "worst_day": round(dly.min())})
+        out.append(row)
+print(pd.DataFrame(out).to_string(index=False, na_rep=""))
+print("fill_pnl = P&L of having been on the favoured side of every Polymarket fill in the cell at its price (rate3y% is a loss rate for the three selling "
+      "rules and a hit rate for buyT). Conditions are measured at each rule's standard entry time for the day, not at each fill's own time.")

@@ -34,12 +34,45 @@ CELLS = [
 ]
 SHORT = {"ethereum": "ETH", "bitcoin": "BTC"}; PRE = {"ethereum": "eth", "bitcoin": "btc"}
 KEYS = ["event_date", "direction", "strike"]
+DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+def load_k(asset):
+    """1m closes for the asset from every kline table on disk, plus daily closes (00:00 ET) and their 30-day average."""
+    parts = []
+    for n in (f"census_{PRE[asset]}.duckdb", f"{PRE[asset]}_hit.duckdb", f"{PRE[asset]}_above.duckdb"):
+        p_ = os.path.join(a.data_dir, n)
+        if os.path.exists(p_):
+            try:
+                d = duckdb.connect(p_, read_only=True); parts.append(d.execute("SELECT open_ts, close FROM klines").df()); d.close()
+            except Exception: pass
+    if not parts: return None
+    kk = pd.concat(parts).drop_duplicates("open_ts").sort_values("open_ts").set_index("open_ts").close
+    f0 = datetime.fromtimestamp(kk.index[0], NY).date() + timedelta(days=1); f1 = datetime.fromtimestamp(kk.index[-1], NY).date()
+    dl = [f0 + timedelta(days=i) for i in range((f1 - f0).days + 1)]
+    dc = pd.Series({d: kk.get(int(datetime(d.year, d.month, d.day, tzinfo=NY).timestamp()), np.nan) for d in dl}).ffill()
+    return kk, dc, dc.rolling(30).mean()
+def tag(K, code, ts, event_date, spot):
+    """Conditions known at entry, and whether filter v1 (fixed 2026-11-26) keeps the trade:
+       carry: 24h move >= -2% AND price above its 30-day average;  sellDn: 24h move >= -2%;
+       sellUp: 24h move between -4% and +2%;  buyT: |24h move| > 4% and the event day is not a Saturday."""
+    dow = DOW[datetime.fromisoformat(event_date).weekday()]
+    if K is None: return dict(r24=None, trend=None, dow=dow, keep=False)
+    kk, dc, ma = K
+    prev = kk.get((int(ts) - 86400) // 60 * 60, np.nan); r24 = (spot / prev - 1) * 100 if prev == prev else np.nan
+    de = datetime.fromtimestamp(int(ts), NY).date(); c_, m_ = dc.get(de, np.nan), ma.get(de, np.nan)
+    above = None if (c_ != c_ or m_ != m_) else bool(c_ >= m_)
+    if r24 != r24: keep = False
+    elif code == "carry": keep = r24 >= -2 and above is True
+    elif code == "sellDn": keep = r24 >= -2
+    elif code == "sellUp": keep = -4 <= r24 <= 2
+    else: keep = abs(r24) > 4 and dow != "Sat"
+    return dict(r24=None if r24 != r24 else round(r24, 2), trend=None if above is None else ("above" if above else "below"), dow=dow, keep=bool(keep))
 def wend(ed):
     d = datetime.fromisoformat(ed); return int((datetime(d.year, d.month, d.day, tzinfo=NY) + timedelta(days=1)).timestamp())
 
 con = sqlite3.connect(a.db)
 trades, makers, days_logged = [], [], set()
 for asset in ("ethereum", "bitcoin"):
+    K = load_k(asset)
     for fam in ("above", "hit"):
         path = os.path.join(a.data_dir, f"{PRE[asset]}_{fam}.duckdb")
         if not os.path.exists(path): print(f"missing {path} — skipping {asset} {fam}"); continue
@@ -85,7 +118,7 @@ for asset in ("ethereum", "bitcoin"):
                 win = None if o is None else (o if c["side"] == "yes" else 1 - o)
                 trades.append(dict(cell=name, event=r.event_date, market=f"{r.direction}{r.strike:g}", entry=datetime.fromtimestamp(r.ts, NY).strftime("%m-%d %H:%M"),
                                    pct=round(r.pct, 2), hrs=round(r.hours, 1), vwap=round(cost / shares, 4), usd=cost, win=win,
-                                   pnl=None if win is None else shares * win - cost))
+                                   pnl=None if win is None else shares * win - cost, **tag(K, c["code"], r.ts, r.event_date, r.spot)))
             # maker ceiling
             w = q.groupby(KEYS).agg(t0=("ts", "min"), t1=("ts", "max")).reset_index()
             g = f.merge(w, on=KEYS); g = g[(g.ts >= g.t0) & (g.ts <= g.t1 + 120)]
@@ -143,6 +176,31 @@ if makers:
     mm["worst_day"] = m.groupby(["cell", "event_date"]).pnl.sum().groupby("cell").min().reindex(mm.index).round(0)
     print(mm.round(0).to_string())
     print(f"all cells: ${m.usd.sum():,.0f} of flow, maker P&L ${m.pnl.sum():+,.0f} ({m.pnl.sum()/m.usd.sum():+.1%}); a real maker captures a fraction of this")
+
+print("\n=== 5. filter v1 (fixed 2026-11-26): carry needs 24h move >= -2% and price above its 30-day average; sellDn needs 24h move >= -2%; "
+      "sellUp needs 24h move between -4% and +2%; buyT needs |24h move| > 4% and not a Saturday ===")
+rows = []
+for cell in order:
+    x = res[res.cell == cell]; kx, sx = x[x.keep], x[~x.keep]
+    rows.append(dict(cell=cell, kept=len(kx), k_wins=int((kx.win == 1).sum()), k_losses=int((kx.win == 0).sum()), k_deployed=round(kx.usd.sum()), k_pnl=round(kx.pnl.sum()),
+                     k_roi=f"{kx.pnl.sum()/kx.usd.sum():+.1%}" if kx.usd.sum() > 0 else "", skipped=len(sx), s_wins=int((sx.win == 1).sum()), s_losses=int((sx.win == 0).sum()),
+                     s_pnl=round(sx.pnl.sum()), s_roi=f"{sx.pnl.sum()/sx.usd.sum():+.1%}" if sx.usd.sum() > 0 else ""))
+print(pd.DataFrame(rows).to_string(index=False))
+kept = res[res.keep]
+if len(kept):
+    pk = kept.pivot_table(index="event", columns="cell", values="pnl", aggfunc="sum").reindex(index=[d for d in days if d in set(res.event)], columns=[o for o in order if o in set(kept.cell)])
+    pk["TOTAL"] = pk.sum(axis=1); pk["cum"] = pk.TOTAL.cumsum(); pk["deployed"] = kept.groupby("event").usd.sum()
+    print("\nkept trades, P&L by event-day:"); print(pk.round(0).to_string(na_rep=""))
+    tk = pk.TOTAL
+    print(f"\nfiltered book: {len(kept)} of {len(res)} trades kept; deployed ${kept.usd.sum():,.0f}; P&L ${kept.pnl.sum():+,.0f} = {kept.pnl.sum()/kept.usd.sum():+.2%} "
+          f"(unfiltered ${res.pnl.sum():+,.0f} = {res.pnl.sum()/res.usd.sum():+.2%}); days up {int((tk > 0).sum())}, down {int((tk < 0).sum())}, no trade {int((tk == 0).sum())}; "
+          f"worst day ${tk.min():+,.0f}; trades skipped would have made ${res[~res.keep].pnl.sum():+,.0f}")
+else:
+    print("\nfilter v1 kept no trades in this period")
+los = res[(res.win == 0) & ~res.cell.str.endswith("buyT")]
+if len(los):
+    print("\nevery losing trade of the three selling rules, with its entry conditions and whether filter v1 kept it:")
+    print(los.assign(usd=los.usd.round(0), pnl=los.pnl.round(0))[["cell", "event", "dow", "market", "entry", "pct", "vwap", "usd", "pnl", "r24", "trend", "keep"]].to_string(index=False))
 
 pend = t[t.pnl.isna()]
 if len(pend): print("\npending (not yet resolved in the fills DBs):"); print(pend[["cell", "event", "market", "entry", "vwap", "usd"]].round(4).to_string(index=False))
