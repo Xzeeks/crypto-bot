@@ -40,8 +40,11 @@ m = pd.read_sql("SELECT event_date, direction, strike, resolve_ts, last_seen FRO
 def wend(ed):
     d = datetime.fromisoformat(ed); return int((datetime(d.year, d.month, d.day, tzinfo=NY) + timedelta(days=1)).timestamp())
 m["window_end"] = m.event_date.map(wend)
-m["touched_log"] = m.resolve_ts < m.window_end - 3600
-m["closed_log"] = (m.last_seen >= m.window_end - 600) | m.touched_log
+# The logger marks a pulled book (CLOB 404) by setting resolve_ts = time_of_404 - 7200. Untouched barriers are pulled too,
+# a few minutes AFTER the window ends, so "pulled" alone does not mean touched: touched = pulled BEFORE the window end.
+m["pulled"] = m.resolve_ts != m.window_end
+m["touched_log"] = m.pulled & (m.resolve_ts + 7200 < m.window_end)
+m["closed_log"] = m.pulled | (m.last_seen >= m.window_end - 600)
 b["window_end"] = b.event_date.map(wend)
 b["hours"] = (b.window_end - b.ts) / 3600
 b["pct"] = np.where(b.direction == "↑", (b.strike - b.spot) / b.spot * 100, (b.spot - b.strike) / b.spot * 100)

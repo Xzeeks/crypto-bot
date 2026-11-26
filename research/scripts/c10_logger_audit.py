@@ -92,9 +92,11 @@ if a.hit:
     d = duckdb.connect(a.hit, read_only=True)
     o = d.execute("SELECT CAST(event_date AS VARCHAR) AS event_date, direction, strike, outcome FROM markets WHERE outcome IS NOT NULL").df(); d.close()
     h = mk[mk.family == "hit"].copy(); h["window_end"] = h.event_date.map(wend)
-    h["mark_touched"] = (h.resolve_ts < h.window_end - 3600).astype(int)
+    # a pulled book is recorded as resolve_ts = time_of_404 - 7200; touched = pulled BEFORE the window end (untouched ones are pulled just after it)
+    h = h[h.resolve_ts != h.window_end]
+    h["mark_touched"] = (h.resolve_ts + 7200 < h.window_end).astype(int)
     j = h.merge(o, on=["event_date", "direction", "strike"])
-    print("touch ladder — logger's early-resolve mark (rows) vs resolved outcome (cols: 0 = not touched, 1 = touched):")
+    print("touch ladder — book pulled before the window end (rows) vs resolved outcome (cols: 0 = not touched, 1 = touched):")
     print(pd.crosstab(j.mark_touched, j.outcome).to_string())
     wrong = j[j.mark_touched != j.outcome]
     if len(wrong): print("disagreements:"); print(wrong[["event_date", "direction", "strike", "outcome", "mark_touched", "resolve_ts", "last_seen"]].head(12).to_string(index=False))
@@ -122,6 +124,10 @@ for fam, path in (("hit", a.hit), ("above", a.above)):
     f["p_yes"] = np.where(f.is_yes, f.price, 1 - f.price); f["buy_yes"] = np.where(f.is_yes, f.side == "BUY", f.side == "SELL")
     g = b[b.family == fam][["ts", "event_date", "direction", "strike", "best_bid", "best_ask"]].rename(columns={"ts": "snap_ts"}).sort_values("snap_ts")
     g["direction"] = g.direction.fillna("")
+    w = g.groupby(["event_date", "direction", "strike"]).snap_ts.agg(t0="min", t1="max").reset_index()
+    n_all = len(f); f = f.merge(w, on=["event_date", "direction", "strike"], how="left")
+    f = f[(f.ts >= f.t0) & (f.ts <= f.t1 + 150)]
+    print(f"{fam:5s} {n_all - len(f):,} of {n_all:,} prints fall outside the logging window of their market (event not yet polled, or already resolved) and are excluded")
     m = pd.merge_asof(f.sort_values("ts"), g, left_on="ts", right_on="snap_ts", by=["event_date", "direction", "strike"], tolerance=150, direction="backward")
     matched = m.dropna(subset=["snap_ts"])
     ref = np.where(matched.buy_yes, matched.best_ask, matched.best_bid)
