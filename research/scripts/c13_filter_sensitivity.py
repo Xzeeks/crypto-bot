@@ -43,27 +43,38 @@ def mask(df, cell, p, distcol):
     return m
 
 def wavg(v, w): return float(np.average(v, weights=w)) if len(v) and w.sum() > 0 else np.nan
-def evaluate(cell, p):
+def all_table(cell, Fc_):
+    """Unfiltered Polymarket price per distance for a cell: the fallback when a filter leaves too few fills at one distance.
+       Where even that is missing, use the most expensive known price (conservative for buyer and seller alike)."""
+    if not len(Fc_): return {}, np.nan
+    dists = sorted(R[R.cell == cell].dist.unique()); dd = np.array(dists, dtype=float); near = dd[np.abs(Fc_.pct.values[:, None] - dd[None, :]).argmin(axis=1)]
+    tab = {d_: wavg(Fc_.q[near == d_], Fc_.usd[near == d_]) for d_ in dists if (near == d_).sum() >= 20}
+    return tab, (max(tab.values()) if tab else wavg(Fc_.q, Fc_.usd))
+def evaluate(cell, p, daily=False):
     x = Rc[mask(Rc, cell, p, "dist")]; y = Fc[mask(Fc, cell, p, "pct")] if len(Fc) else Fc
     sell = SELL[cell]; tr, te = x[x.year <= 2025], x[x.year >= 2026]
     out = {"kept%": round(x.D.nunique() / max(Rc.D.nunique(), 1) * 100), "trades": len(x),
            "loss% train": round(tr.ev.mean() * 100, 2) if len(tr) else np.nan, "loss% test": round(te.ev.mean() * 100, 2) if len(te) else np.nan,
            "fdays": y.D.nunique() if len(y) else 0}
-    if out["fdays"] < a.min_fdays or len(x) == 0:
+    if (out["fdays"] < a.min_fdays and not p.get("_force")) or len(x) == 0 or not len(y):
         out.update({"px": np.nan, "roi%": np.nan, "roi% 1pt": np.nan, "pnl": np.nan, "pnl train": np.nan, "pnl test": np.nan, "worst day": np.nan, "maxDD": np.nan, "thin": True}); return out
     dists = sorted(x.dist.unique()); dd = np.array(dists, dtype=float); near = dd[np.abs(y.pct.values[:, None] - dd[None, :]).argmin(axis=1)]
     base = wavg(y.q, y.usd); tab = {}
     for d_ in dists:
         m_ = near == d_
-        tab[d_] = wavg(y.q[m_], y.usd[m_]) if m_.sum() >= 20 and y.usd[m_].sum() > 0 else base
+        tab[d_] = wavg(y.q[m_], y.usd[m_]) if m_.sum() >= 20 and y.usd[m_].sum() > 0 else ALLTAB.get(d_, ALLMAX)
     q = np.clip(x.dist.map(tab).values, 0.001, 0.999); win = (1 - x.ev.values.astype(float)) if sell else x.ev.values.astype(float)
     pnl = STAKE * (win / q - 1); pnl1 = STAKE * (win / np.clip(q + 0.01, 0.001, 0.999) - 1)
     dly = pd.Series(pnl).groupby(x.D.values).sum(); eq = dly.cumsum(); yr = x.year.values
-    out.update({"px": round(base, 4), "roi%": round(pnl.mean() / STAKE * 100, 2), "roi% 1pt": round(pnl1.mean() / STAKE * 100, 2), "pnl": round(pnl.sum()),
+    out.update({"px": round(float(q.mean()), 4), "roi%": round(pnl.mean() / STAKE * 100, 2), "roi% 1pt": round(pnl1.mean() / STAKE * 100, 2), "pnl": round(pnl.sum()),
                 "pnl train": round(pnl[yr <= 2025].sum()), "pnl test": round(pnl[yr >= 2026].sum()), "worst day": round(dly.min()), "maxDD": round((eq - eq.cummax()).min()), "thin": False})
+    if daily: out["_daily"] = dly; out["_n"] = pd.Series(1, index=x.D.values).groupby(level=0).sum()
     return out
 
 V1 = {"carry": dict(r24_min=-2, trend_min=0), "sellDn": dict(r24_min=-2), "sellUp": dict(r24_min=-4, r24_max=2), "buyT": dict(abs_min=4, skip=("Sat",))}
+# filter v2 candidate (2026-11-27): only changes that held on both assets, in both periods, across neighbouring thresholds
+V2 = {"carry": dict(r24_min=-2, trend_min=0, dist_min=6, skip=("Mon", "Tue")), "sellDn": dict(r24_min=-2, dist_min=5, skip=("Sun",)),
+      "sellUp": dict(r24_min=-4, r24_max=2, skip=("Mon",), dist_min=4 if a.asset == "ethereum" else 3), "buyT": dict(abs_min=4, skip=("Sat",))}
 ONE = {  # one threshold at a time (others at v1): (label, key, values)
     "carry":  [("24h move no worse than", "r24_min", [NONE, -5, -4, -3, -2, -1, 0]), ("price vs 30d average at least (%)", "trend_min", [NONE, -5, 0, 3, 6]),
                ("nearest distance traded (%)", "dist_min", [5, 6, 7]), ("skip event days", "skip", [(), ("Mon",), ("Mon", "Tue")]), ("only event days", "only", [(), ("Sat", "Sun")])],
@@ -94,10 +105,11 @@ print(f"##### {a.asset}: {R.D.nunique()} days ({R.D.min()} .. {R.D.max()}); TRAI
       f"'thin' = fewer than {a.min_fdays} Polymarket fill-days, price unknown")
 for cell in ("carry", "sellDn", "sellUp", "buyT"):
     Rc = R[R.cell == cell].reset_index(drop=True); Fc = F[F.cell == cell].reset_index(drop=True) if len(F) else F
+    ALLTAB, ALLMAX = all_table(cell, Fc)
     kind = "LOSS rate" if SELL[cell] else "HIT rate (higher is better for the buyer)"
     print(f"\n================ {a.asset} {cell}: loss% columns show the {kind} ================")
     print("\n-- 1. baseline --")
-    print(fmt([dict({"filter": "none"}, **evaluate(cell, {})), dict({"filter": "v1"}, **evaluate(cell, V1[cell]))]))
+    print(fmt([dict({"filter": "none"}, **evaluate(cell, {})), dict({"filter": "v1"}, **evaluate(cell, V1[cell])), dict({"filter": "v2 candidate"}, **evaluate(cell, V2[cell]))]))
     print("\n-- 2. one threshold at a time (everything else at v1) --")
     for label, key, vals in ONE[cell]:
         rows = []
@@ -121,3 +133,21 @@ for cell in ("carry", "sellDn", "sellUp", "buyT"):
         else: print("no candidate is positive in train, in test, and at prices 1 point worse")
     else:
         print("no candidate has enough Polymarket fill-days to price")
+
+# ---------- the three selling rules as one book: no filter vs v1 vs the v2 candidate ----------
+print(f"\n================ {a.asset}: the three selling rules as one book (SIMULATION, ${STAKE:,.0f} per trade) ================")
+rows = []
+for name, FS in (("none", {c_: {} for c_ in V1}), ("v1", V1), ("v2 candidate", V2)):
+    dl, nn = [], []
+    for cell in ("carry", "sellDn", "sellUp"):
+        Rc = R[R.cell == cell].reset_index(drop=True); Fc = F[F.cell == cell].reset_index(drop=True) if len(F) else F
+        ALLTAB, ALLMAX = all_table(cell, Fc)
+        e = evaluate(cell, dict(FS[cell], _force=True), daily=True)
+        if "_daily" in e: dl.append(e["_daily"]); nn.append(e["_n"])
+    if not dl: continue
+    book = pd.concat(dl, axis=1).fillna(0).sum(axis=1).sort_index(); n = pd.concat(nn, axis=1).fillna(0).sum(axis=1) * STAKE
+    yr = np.array([d_.year for d_ in book.index]); mon = book.groupby(np.array([d_.year * 100 + d_.month for d_ in book.index])).sum(); eq = book.cumsum()
+    rows.append({"filter": name, "days traded": int((n > 0).sum()), "avg $ at work": round(n[n > 0].mean()), "max $ at work": round(n.max()), "total staked": round(n.sum()),
+                 "pnl": round(book.sum()), "roi%": round(book.sum() / n.sum() * 100, 2), "pnl train": round(book[yr <= 2025].sum()), "pnl test": round(book[yr >= 2026].sum()),
+                 "losing days": int((book < 0).sum()), "worst day": round(book.min()), "maxDD": round((eq - eq.cummax()).min()), "months +": f"{int((mon > 0).sum())}/{len(mon)}", "worst month": round(mon.min())})
+print(pd.DataFrame(rows).to_string(index=False))
