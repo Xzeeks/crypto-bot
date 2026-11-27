@@ -223,7 +223,7 @@ for cell in order + ["SELLING BOOK", "ALL"]:
                   f"{lab}_roi": f"{y.pnl.sum()/y.usd.sum():+.1%}" if y.usd.sum() > 0 else "", f"{lab}_worst": round(d.min()) if len(d) else 0})
     rows.append(r)
 print(pd.DataFrame(rows).to_string(index=False))
-los2 = res[(res.win == 0) & res.keep2]
+los2 = res[(res.win == 0) & res.keep2 & ~res.cell.str.endswith("buyT")]
 print(f"losing trades kept by v2: {len(los2)}" + ("" if los2.empty else "\n" + los2.assign(pnl=los2.pnl.round(0))[["cell", "event", "dow", "market", "entry", "pct", "vwap", "pnl", "r24", "trend"]].to_string(index=False)))
 
 pend = t[t.pnl.isna()]
