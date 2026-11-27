@@ -71,8 +71,10 @@ for D in alld:
         Dref = D - timedelta(days=1) if cell == "carry" else D        # vol regime and trend as known at the start of the ENTRY day (no look-ahead for carry)
         if te not in k.index or np.isnan(rv30.get(Dref, np.nan)) or np.isnan(ma30.get(Dref, np.nan)): continue
         spot = k.close[te]; prev = k.close.get(te - 86400, np.nan)
+        r24v = (spot / prev - 1) * 100 if prev == prev else np.nan
         ft = dict(dow=DOW[D.weekday()], wk="Sat/Sun" if D.weekday() >= 5 else "Mon-Fri", rv=rv_b(rv30[Dref]),
-                  trend="above 30d avg" if dc[Dref] >= ma30[Dref] else "below 30d avg", r24=r24_b((spot / prev - 1) * 100 if prev == prev else np.nan))
+                  trend="above 30d avg" if dc[Dref] >= ma30[Dref] else "below 30d avg", r24=r24_b(r24v),
+                  r24v=r24v, trendv=(dc[Dref] / ma30[Dref] - 1) * 100, rvv=rv30[Dref], rngv=np.nan)   # raw values, for the sensitivity study (c13)
         if cell == "carry":
             fin = k.close.get(noon(D) - 60, np.nan)
             if fin != fin: continue
@@ -80,16 +82,17 @@ for D in alld:
             for dist in c["dists"]: rows.append(dict(ft, cell=cell, D=D, dist=dist, ev=fin <= spot / (1 + dist / 100)))
         else:
             past = day.loc[:te]; rest = day.loc[te + 60:]
-            ft["rng"] = rng_b((past.high.max() - past.low.min()) / past.close.iloc[0] * 100); feats[(cell, D)] = ft
+            ft["rngv"] = (past.high.max() - past.low.min()) / past.close.iloc[0] * 100
+            ft["rng"] = rng_b(ft["rngv"]); feats[(cell, D)] = ft
             sides = [c["dirs"]] if c["dirs"] else ["↓", "↑"]
             for s in sides:
                 for dist in c["dists"]:
                     if s == "↓":
                         b = spot * (1 - dist / 100)
-                        if past.low.min() > b: rows.append(dict(ft, cell=cell, D=D, dist=dist, ev=rest.low.min() <= b))
+                        if past.low.min() > b: rows.append(dict(ft, cell=cell, D=D, dist=dist, side="dn", ev=rest.low.min() <= b))
                     else:
                         b = spot * (1 + dist / 100)
-                        if past.high.max() < b: rows.append(dict(ft, cell=cell, D=D, dist=dist, ev=rest.high.max() >= b))
+                        if past.high.max() < b: rows.append(dict(ft, cell=cell, D=D, dist=dist, side="up", ev=rest.high.max() >= b))
 R = pd.DataFrame(rows)
 print(f"##### {a.asset}: risk from {R.D.nunique()} days ({R.D.min()} .. {R.D.max()}); 30d realized-vol terciles: low < {rv_cut[0]:.0f}% <= mid < {rv_cut[1]:.0f}% <= high")
 
@@ -97,7 +100,7 @@ print(f"##### {a.asset}: risk from {R.D.nunique()} days ({R.D.min()} .. {R.D.max
 F = []
 def tag(df, cell):
     ok = [(cell, d) in feats for d in df.D]; df = df[ok].copy()
-    for col in ("dow", "wk", "rv", "trend", "r24", "rng"): df[col] = [feats[(cell, d)][col] for d in df.D]
+    for col in ("dow", "wk", "rv", "trend", "r24", "rng", "r24v", "trendv", "rvv", "rngv"): df[col] = [feats[(cell, d)][col] for d in df.D]
     df["cell"] = cell; return df
 if os.path.exists(P(f"{pre}_above.duckdb")):
     d = duckdb.connect(P(f"{pre}_above.duckdb"), read_only=True)
@@ -245,3 +248,6 @@ if daily_all:
               f"max drawdown ${maxdd(book):+,.0f}; months positive {int((mon > 0).sum())}/{len(mon)}; worst month ${mon.min():+,.0f}")
         w = book.sort_values().head(8)
         print("worst days: " + ", ".join(f"{d_} ${v:+,.0f}" for d_, v in w.items()))
+
+R.to_pickle(P(f"c12_{pre}_R.pkl")); F.to_pickle(P(f"c12_{pre}_F.pkl"))
+print(f"\nsaved {P(f'c12_{pre}_R.pkl')} and {P(f'c12_{pre}_F.pkl')} for the sensitivity study (c13)")
