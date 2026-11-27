@@ -134,6 +134,15 @@ t = pd.DataFrame(trades)
 if t.empty: raise SystemExit("no shadow trades found")
 days = sorted(days_logged); order = [f"{s} {c['code']}" for c in CELLS for s in ("ETH", "BTC")]
 order = [o for o in order if o in set(t.cell)]
+# filter v2 candidate (2026-11-27): v1 plus a minimum distance and skipped event-days. v1 stays the fixed baseline.
+def keep_v2(r):
+    code, eth = r.cell.split()[1], r.cell.startswith("ETH")
+    if not r.keep: return False
+    if code == "carry": return r.pct >= 6 and r.dow not in ("Mon", "Tue")
+    if code == "sellDn": return r.pct >= 5 and r.dow != "Sun"
+    if code == "sellUp": return r.dow != "Mon" and r.pct >= (4 if eth else 3)
+    return True
+t["keep2"] = t.apply(keep_v2, axis=1)
 res = t.dropna(subset=["pnl"])
 print(f"##### shadow review: {len(days)} event-days logged ({days[0]} .. {days[-1]}), cap ${a.cap:,.0f} per cell per day, taker paper\n")
 
@@ -201,6 +210,21 @@ los = res[(res.win == 0) & ~res.cell.str.endswith("buyT")]
 if len(los):
     print("\nevery losing trade of the three selling rules, with its entry conditions and whether filter v1 kept it:")
     print(los.assign(usd=los.usd.round(0), pnl=los.pnl.round(0))[["cell", "event", "dow", "market", "entry", "pct", "vwap", "usd", "pnl", "r24", "trend", "keep"]].to_string(index=False))
+
+print("\n=== 6. filter v2 candidate (2026-11-27) next to v1: carry adds strike >= 6% away, no Mon/Tue; sellDn adds level >= 5% away, no Sun; "
+      "sellUp adds no Mon and (ETH) level >= 4% away; buyT unchanged ===")
+rows = []
+for cell in order + ["SELLING BOOK", "ALL"]:
+    x = res if cell == "ALL" else res[~res.cell.str.endswith("buyT")] if cell == "SELLING BOOK" else res[res.cell == cell]
+    r = dict(cell=cell)
+    for lab, m in (("all", np.ones(len(x), bool)), ("v1", x.keep.values), ("v2", x.keep2.values)):
+        y = x[m]; d = y.groupby("event").pnl.sum()
+        r.update({f"{lab}_n": len(y), f"{lab}_loss": int((y.win == 0).sum()), f"{lab}_usd": round(y.usd.sum()), f"{lab}_pnl": round(y.pnl.sum()),
+                  f"{lab}_roi": f"{y.pnl.sum()/y.usd.sum():+.1%}" if y.usd.sum() > 0 else "", f"{lab}_worst": round(d.min()) if len(d) else 0})
+    rows.append(r)
+print(pd.DataFrame(rows).to_string(index=False))
+los2 = res[(res.win == 0) & res.keep2]
+print(f"losing trades kept by v2: {len(los2)}" + ("" if los2.empty else "\n" + los2.assign(pnl=los2.pnl.round(0))[["cell", "event", "dow", "market", "entry", "pct", "vwap", "pnl", "r24", "trend"]].to_string(index=False)))
 
 pend = t[t.pnl.isna()]
 if len(pend): print("\npending (not yet resolved in the fills DBs):"); print(pend[["cell", "event", "market", "entry", "vwap", "usd"]].round(4).to_string(index=False))
