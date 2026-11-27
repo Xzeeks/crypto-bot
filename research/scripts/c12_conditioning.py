@@ -107,7 +107,7 @@ if os.path.exists(P(f"{pre}_above.duckdb")):
     f["hours"] = (f.resolve_ts - f.ts) / 3600; f["pct"] = (f.spot - f.strike) / f.strike * 100
     c = CELLS["carry"]; f = f[f.pct.between(*c["pct"]) & f.hours.between(*c["hours"])]
     f["q"] = np.where(f.is_yes, f.price, 1 - f.price); f["ev"] = 1 - f.outcome; f["usd"] = f["size"] * f.q
-    F.append(tag(f[["D", "q", "ev", "usd"]], "carry"))
+    F.append(tag(f[["D", "q", "ev", "usd", "pct"]], "carry"))
 if os.path.exists(P(f"{pre}_hit.duckdb")):
     d = duckdb.connect(P(f"{pre}_hit.duckdb"), read_only=True)
     mk = d.execute("SELECT condition_id, event_date AS D, direction, strike, window_start, window_end, outcome, yes_token FROM markets WHERE outcome IS NOT NULL").df()
@@ -128,7 +128,7 @@ if os.path.exists(P(f"{pre}_hit.duckdb")):
         if c["dirs"]: g = g[g.direction == c["dirs"]]
         g = g.assign(q=(1 - g.p_yes) if c["sell"] else g.p_yes, ev=g.outcome)
         g = g.assign(usd=g["size"] * g.q)
-        F.append(tag(g[["D", "q", "ev", "usd"]], cell))
+        F.append(tag(g[["D", "q", "ev", "usd", "pct"]], cell))
 F = pd.concat(F) if F else pd.DataFrame(columns=["cell"])
 
 FEATURES = [("wk", "weekend vs weekday (event day)", ["Mon-Fri", "Sat/Sun"]), ("dow", "day of week (event day)", DOW),
@@ -183,3 +183,65 @@ for cell, c in CELLS.items():
 print(pd.DataFrame(out).to_string(index=False, na_rep=""))
 print("fill_pnl = P&L of having been on the favoured side of every Polymarket fill in the cell at its price (rate3y% is a loss rate for the three selling "
       "rules and a hit rate for buyT). Conditions are measured at each rule's standard entry time for the day, not at each fill's own time.")
+
+# ---------- filter v1 across the full history: facts by year, then a SIMULATION at Polymarket's observed prices ----------
+print(f"\n================ {a.asset}: filter v1 over the full history ================")
+R["year"] = [d.year for d in R.D]
+print("\n-- A. FACT (Binance prices only): event rate % by year, kept vs skipped days (loss rate for carry/sellDn/sellUp, hit rate for buyT) --")
+out = []
+for cell in CELLS:
+    for yr, x in R[R.cell == cell].groupby("year"):
+        kx, sx = x[x.keep], x[~x.keep]
+        out.append({"cell": cell, "year": yr, "days": x.D.nunique(), "kept_days": kx.D.nunique(), "kept_rate%": round(kx.ev.mean() * 100, 2) if len(kx) else None,
+                    "skipped_days": sx.D.nunique(), "skipped_rate%": round(sx.ev.mean() * 100, 2) if len(sx) else None})
+print(pd.DataFrame(out).to_string(index=False, na_rep=""))
+
+STAKE = 1000.0
+def price_table(cell, kept_only):
+    """$-weighted price paid in Polymarket fills for the favoured side, per distance (nearest whole %), plus the cell average under key None."""
+    y = F[F.cell == cell] if len(F) else F
+    if kept_only and len(y): y = y[y.keep]
+    tab = {}
+    if len(y):
+        dd_ = np.array(CELLS[cell]["dists"], dtype=float); near = dd_[np.abs(y.pct.values[:, None] - dd_[None, :]).argmin(axis=1)]
+        for d_ in CELLS[cell]["dists"]:
+            m_ = near == d_
+            if m_.sum() >= 20 and y.usd[m_].sum() > 0: tab[d_] = wavg(y.q[m_], y.usd[m_])
+        tab[None] = wavg(y.q, y.usd)
+    return tab
+def simulate(x, tab, sell, bump=0.0):
+    q = np.clip(np.array([tab.get(d_, tab[None]) for d_ in x.dist]) + bump, 0.001, 0.999)
+    win = (1 - x.ev.values.astype(float)) if sell else x.ev.values.astype(float)
+    return pd.Series(STAKE * (win / q - 1), index=x.index)
+def maxdd(daily):
+    eq = daily.cumsum(); return float((eq - eq.cummax()).min()) if len(eq) else 0.0
+
+print(f"\n-- B. SIMULATION: ${STAKE:,.0f} staked on every kept trade for the whole history, priced at what Polymarket has charged on kept days since launch --")
+print("   (Polymarket did not list these markets before 2026, so earlier prices are an assumption; '1pt worse' reprices every trade one point against us)")
+out, daily_all, sell_cells = [], {}, []
+for cell, c in CELLS.items():
+    tab = price_table(cell, True); tab_all = price_table(cell, False)
+    if None not in tab: print(f"{cell}: no kept-day fills to price from — skipped"); continue
+    x = R[(R.cell == cell) & R.keep].copy(); xa = R[R.cell == cell]
+    pnl = simulate(x, tab, c["sell"]); pnl_w = simulate(x, tab, c["sell"], 0.01); pnl_u = simulate(xa, tab_all, c["sell"]) if None in tab_all else pd.Series(dtype=float)
+    dly = pnl.groupby(x.D).sum(); daily_all[cell] = dly
+    if c["sell"]: sell_cells.append(cell)
+    out.append({"cell": cell, "assumed price by distance": ", ".join(f"{d_}%:{tab.get(d_, tab[None]):.3f}" for d_ in c["dists"]), "trades": len(x), "days": x.D.nunique(),
+                "staked": round(len(x) * STAKE), "pnl": round(pnl.sum()), "roi%": round(pnl.sum() / (len(x) * STAKE) * 100, 2), "roi% 1pt worse": round(pnl_w.sum() / (len(x) * STAKE) * 100, 2),
+                "losing_days": int((dly < 0).sum()), "worst_day": round(dly.min()), "max_drawdown": round(maxdd(dly)),
+                "unfiltered roi%": round(pnl_u.sum() / (len(xa) * STAKE) * 100, 2) if len(pnl_u) else None})
+print(pd.DataFrame(out).to_string(index=False, na_rep=""))
+
+if daily_all:
+    yr = pd.DataFrame({cell: d_.groupby(np.array([x_.year for x_ in d_.index])).sum() for cell, d_ in daily_all.items()}).fillna(0)
+    yr["selling rules"] = yr[[c_ for c_ in sell_cells if c_ in yr]].sum(axis=1)
+    print("\n-- C. SIMULATION: P&L by year ($) --"); print(yr.round(0).to_string())
+    if sell_cells:
+        book = pd.concat([daily_all[c_] for c_ in sell_cells], axis=1).fillna(0).sum(axis=1).sort_index()
+        mon = book.groupby(np.array([d_.year * 100 + d_.month for d_ in book.index])).sum()
+        staked_day = pd.concat([R[(R.cell == c_) & R.keep].groupby("D").size() for c_ in sell_cells], axis=1).fillna(0).sum(axis=1) * STAKE
+        print(f"\n-- D. SIMULATION: the three selling rules as one book --\ndays with a trade {int((staked_day > 0).sum())}; total staked ${staked_day.sum():,.0f} (avg ${staked_day[staked_day > 0].mean():,.0f}, max ${staked_day.max():,.0f} on a day); "
+              f"P&L ${book.sum():+,.0f} = {book.sum()/staked_day.sum():+.2%} of stakes; losing days {int((book < 0).sum())}; worst day ${book.min():+,.0f}; "
+              f"max drawdown ${maxdd(book):+,.0f}; months positive {int((mon > 0).sum())}/{len(mon)}; worst month ${mon.min():+,.0f}")
+        w = book.sort_values().head(8)
+        print("worst days: " + ", ".join(f"{d_} ${v:+,.0f}" for d_, v in w.items()))
