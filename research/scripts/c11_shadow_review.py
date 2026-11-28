@@ -24,6 +24,7 @@ NY = ZoneInfo("America/New_York"); EPS = 1e-9
 ap = argparse.ArgumentParser()
 ap.add_argument("db"); ap.add_argument("--data-dir", default="research/data"); ap.add_argument("--cap", type=float, default=5000)
 ap.add_argument("--trades", action="store_true", help="also print every individual trade")
+ap.add_argument("--fee-rate", type=float, default=0.01, help="Polymarket taker fee rate for these markets: fee = shares x rate x price x (1 - price). 0.01 = 'Crypto, all other markets' in the fee table as of 2026-11-28")
 a = ap.parse_args()
 
 CELLS = [
@@ -71,8 +72,32 @@ def tag(K, code, ts, event_date, spot):
 def wend(ed):
     d = datetime.fromisoformat(ed); return int((datetime(d.year, d.month, d.day, tzinfo=NY) + timedelta(days=1)).timestamp())
 
+# Filters as rules on a single snapshot (used in section 7, where each filter is run as its own strategy).
+H3 = {"carry": 24, "sellDn": 6, "sellUp": 9, "buyT": 18}; Z3 = {"carry": 2.5, "sellDn": 3.5, "sellUp": 2.5}
+def zscore(code, pct, rv): return pct / (rv / np.sqrt(365) * np.sqrt(H3[code] / 24)) if rv is not None and rv == rv and rv > 0 else np.nan
+def passes(strategy, code, asset, pct, tg):
+    if strategy == "none": return True
+    if not tg["keep"]: return False                      # v1 is the base of v2 and v3
+    if strategy == "v1" or code == "buyT": return True
+    if strategy == "v2":
+        if code == "carry": return pct >= 6 and tg["dow"] not in ("Mon", "Tue")
+        if code == "sellDn": return pct >= 5 and tg["dow"] != "Sun"
+        return tg["dow"] != "Mon" and pct >= (4 if asset == "ethereum" else 3)
+    z = zscore(code, pct, tg["rv"])                      # v3
+    if z != z or z < Z3[code]: return False
+    return not ((code == "sellDn" and tg["dow"] == "Sun") or (code == "sellUp" and tg["dow"] == "Mon"))
+def walk(r, side, limit, rem):
+    """Walk the logged book inside the price limit, spending at most `rem` dollars. -> (cost, shares)"""
+    if side == "yes": lev = [(p, p * z) for p, z in sorted(json.loads(r.asks_json)) if 0 < p <= limit + EPS]
+    else: lev = [(1 - p, (1 - p) * z) for p, z in sorted(json.loads(r.bids_json), reverse=True) if 1 - p <= limit + EPS and p < 1]
+    cost = shares = 0.0
+    for px, usd in lev:
+        if rem <= EPS: break
+        take = min(usd, rem); cost += take; shares += take / px; rem -= take
+    return cost, shares
+
 con = sqlite3.connect(a.db)
-trades, makers, days_logged = [], [], set()
+trades, makers, days_logged, strat = [], [], set(), []
 for asset in ("ethereum", "bitcoin"):
     K = load_k(asset)
     for fam in ("above", "hit"):
@@ -121,6 +146,29 @@ for asset in ("ethereum", "bitcoin"):
                 trades.append(dict(cell=name, event=r.event_date, market=f"{r.direction}{r.strike:g}", entry=datetime.fromtimestamp(r.ts, NY).strftime("%m-%d %H:%M"),
                                    pct=round(r.pct, 2), hrs=round(r.hours, 1), vwap=round(cost / shares, 4), usd=cost, win=win,
                                    pnl=None if win is None else shares * win - cost, **tag(K, c["code"], r.ts, r.event_date, r.spot)))
+            # --- section 7: each filter run as its own strategy. A filter-aware trader waits for the first snapshot that is inside the
+            # price limit AND passes the filter (the 24h move, the distance and z all change through the window), and the daily cap is
+            # spent only on trades that filter takes. Ties at the same snapshot go to the nearest level first.
+            qq = q[px_now <= c["limit"] + EPS].sort_values(["ts", "pct"])
+            tags = [tag(K, c["code"], ts_, ed_, sp_) for ts_, ed_, sp_ in zip(qq.ts, qq.event_date, qq.spot)]
+            first_ts = qq.groupby(KEYS).ts.min().to_dict()
+            for sname in ("none", "v1", "v2", "v3"):
+                ok = np.array([passes(sname, c["code"], asset, p_, tg_) for p_, tg_ in zip(qq.pct, tags)], dtype=bool)
+                if not ok.any(): continue
+                sel_ = qq[ok]; tsel = [tg_ for tg_, o_ in zip(tags, ok) if o_]
+                seen, spent7 = set(), {}
+                for r, tg_ in zip(sel_.itertuples(), tsel):
+                    k_ = (r.event_date, r.direction, r.strike)
+                    if k_ in seen: continue
+                    seen.add(k_)
+                    cost, shares = walk(r, c["side"], c["limit"], a.cap - spent7.get(r.event_date, 0.0))
+                    if cost <= 0: continue
+                    spent7[r.event_date] = spent7.get(r.event_date, 0.0) + cost
+                    o = out.get((r.event_date, r.direction, float(r.strike))); win = None if o is None else (o if c["side"] == "yes" else 1 - o)
+                    vw = cost / shares; fee = shares * a.fee_rate * vw * (1 - vw)
+                    strat.append(dict(strategy=sname, cell=name, event=r.event_date, market=f"{r.direction}{r.strike:g}", entry=datetime.fromtimestamp(r.ts, NY).strftime("%m-%d %H:%M"),
+                                      waited_min=round((r.ts - first_ts[k_]) / 60), pct=round(r.pct, 2), z=round(zscore(c["code"], r.pct, tg_["rv"]), 2), vwap=round(vw, 4), usd=cost, fee=fee, win=win,
+                                      pnl=None if win is None else shares * win - cost, r24=tg_["r24"], trend=tg_["trend"], dow=tg_["dow"]))
             # maker ceiling
             w = q.groupby(KEYS).agg(t0=("ts", "min"), t1=("ts", "max")).reset_index()
             g = f.merge(w, on=KEYS); g = g[(g.ts >= g.t0) & (g.ts <= g.t1 + 120)]
@@ -148,7 +196,6 @@ t["keep2"] = t.apply(keep_v2, axis=1)
 # filter v3 candidate (2026-11-28): v1's conditions with distance measured in typical moves. z = distance % / expected move over the
 # rule's standard horizon (carry 24h, sellDn 6h, sellUp 9h, buyT 18h), from the 30-day realized vol known at the start of the entry day.
 # carry z >= 2.5; sellDn z >= 3.5 and not Sunday; sellUp z >= 2.5 and not Monday; buyT unchanged. Same thresholds on both assets (c16).
-H3 = {"carry": 24, "sellDn": 6, "sellUp": 9, "buyT": 18}; Z3 = {"carry": 2.5, "sellDn": 3.5, "sellUp": 2.5}
 t["z"] = [round(p_ / (rv_ / np.sqrt(365) * np.sqrt(H3[c_.split()[1]] / 24)), 2) if rv_ is not None and rv_ == rv_ and rv_ > 0 else np.nan for p_, rv_, c_ in zip(t.pct, t.rv, t.cell)]
 def keep_v3(r):
     code = r.cell.split()[1]
@@ -244,6 +291,32 @@ los3 = res[(res.win == 0) & res.keep3 & ~res.cell.str.endswith("buyT")]
 print(f"losing trades kept by v3: {len(los3)}" + ("" if los3.empty else "\n" + los3.assign(pnl=los3.pnl.round(0))[["cell", "event", "dow", "market", "entry", "pct", "z", "rv", "vwap", "pnl", "r24", "trend"]].to_string(index=False)))
 sel = res[~res.cell.str.endswith("buyT")]
 if len(sel): print("selling trades by z (v1-kept only): " + "; ".join(f"{c_}: median z {x_.z.median():.1f}, {int((x_.z >= Z3[c_.split()[1]]).sum())}/{len(x_)} at or above the v3 floor" for c_, x_ in sel[sel.keep].groupby("cell")))
+
+print(f"\n=== 7. EACH FILTER AS ITS OWN STRATEGY (use this for comparing filters) ===")
+print("Sections 5 and 6 pick each market's first in-limit snapshot with no filter, then tick it kept or skipped. That understates a filter: it never waits for a later")
+print("snapshot that would pass, and the daily cap is spent on trades the filter would not take. Here each filter enters at the first snapshot that passes it and")
+print(f"has the whole ${a.cap:,.0f} cap per cell per day to itself. 'fees' = taker fee at rate {a.fee_rate} (shares x rate x price x (1 - price)); 'net' = pnl - fees.")
+S7 = pd.DataFrame(strat)
+if len(S7):
+    R7 = S7.dropna(subset=["pnl"]); rows = []
+    for cell in order + ["SELLING BOOK", "ALL"]:
+        x = R7 if cell == "ALL" else R7[~R7.cell.str.endswith("buyT")] if cell == "SELLING BOOK" else R7[R7.cell == cell]
+        r = dict(cell=cell)
+        for lab in ("none", "v1", "v2", "v3"):
+            y = x[x.strategy == lab]; d = y.groupby("event").pnl.sum()
+            r.update({f"{lab}_n": len(y), f"{lab}_loss": int((y.win == 0).sum()), f"{lab}_usd": round(y.usd.sum()), f"{lab}_pnl": round(y.pnl.sum()), f"{lab}_fees": round(y.fee.sum()),
+                      f"{lab}_net": round(y.pnl.sum() - y.fee.sum()), f"{lab}_roi": f"{(y.pnl.sum() - y.fee.sum())/y.usd.sum():+.1%}" if y.usd.sum() > 0 else "", f"{lab}_worst": round(d.min()) if len(d) else 0})
+        rows.append(r)
+    print(pd.DataFrame(rows).to_string(index=False))
+    sb = R7[~R7.cell.str.endswith("buyT")]
+    for lab in ("v1", "v2", "v3"):
+        y = sb[sb.strategy == lab]; late = y[y.waited_min > 0]
+        print(f"{lab} selling trades: {len(y)}; entered later than the unfiltered first snapshot: {len(late)} (median wait {late.waited_min.median() if len(late) else 0:.0f} min); losses: {int((y.win == 0).sum())}")
+    lo7 = sb[(sb.win == 0) & (sb.strategy != "none")]
+    print(f"losing selling trades taken by a filter: {len(lo7)}" + ("" if lo7.empty else "\n" + lo7.assign(pnl=lo7.pnl.round(0), usd=lo7.usd.round(0))[["strategy", "cell", "event", "dow", "market", "entry", "waited_min", "pct", "z", "vwap", "usd", "pnl", "r24", "trend"]].to_string(index=False)))
+    d7 = R7.assign(net=R7.pnl - R7.fee).pivot_table(index="event", columns="strategy", values="net", aggfunc="sum").reindex(columns=["none", "v1", "v2", "v3"])
+    ds = sb.assign(net=sb.pnl - sb.fee).pivot_table(index="event", columns="strategy", values="net", aggfunc="sum").reindex(columns=["none", "v1", "v2", "v3"])
+    print("\nnet P&L by event-day — selling rules only | all rules:"); print(pd.concat({"selling": ds, "all": d7}, axis=1).round(0).to_string(na_rep=""))
 
 pend = t[t.pnl.isna()]
 if len(pend): print("\npending (not yet resolved in the fills DBs):"); print(pend[["cell", "event", "market", "entry", "vwap", "usd"]].round(4).to_string(index=False))
