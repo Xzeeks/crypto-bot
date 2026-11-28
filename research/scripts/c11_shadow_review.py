@@ -49,14 +49,15 @@ def load_k(asset):
     f0 = datetime.fromtimestamp(kk.index[0], NY).date() + timedelta(days=1); f1 = datetime.fromtimestamp(kk.index[-1], NY).date()
     dl = [f0 + timedelta(days=i) for i in range((f1 - f0).days + 1)]
     dc = pd.Series({d: kk.get(int(datetime(d.year, d.month, d.day, tzinfo=NY).timestamp()), np.nan) for d in dl}).ffill()
-    return kk, dc, dc.rolling(30).mean()
+    rv = np.log(dc).diff().rolling(30).std() * np.sqrt(365) * 100          # 30-day realized vol, annualized %, as known at the start of each day
+    return kk, dc, dc.rolling(30).mean(), rv
 def tag(K, code, ts, event_date, spot):
     """Conditions known at entry, and whether filter v1 (fixed 2026-11-26) keeps the trade:
        carry: 24h move >= -2% AND price above its 30-day average;  sellDn: 24h move >= -2%;
        sellUp: 24h move between -4% and +2%;  buyT: |24h move| > 4% and the event day is not a Saturday."""
     dow = DOW[datetime.fromisoformat(event_date).weekday()]
-    if K is None: return dict(r24=None, trend=None, dow=dow, keep=False)
-    kk, dc, ma = K
+    if K is None: return dict(r24=None, trend=None, dow=dow, keep=False, rv=None)
+    kk, dc, ma, rvs = K
     prev = kk.get((int(ts) - 86400) // 60 * 60, np.nan); r24 = (spot / prev - 1) * 100 if prev == prev else np.nan
     de = datetime.fromtimestamp(int(ts), NY).date(); c_, m_ = dc.get(de, np.nan), ma.get(de, np.nan)
     above = None if (c_ != c_ or m_ != m_) else bool(c_ >= m_)
@@ -65,7 +66,8 @@ def tag(K, code, ts, event_date, spot):
     elif code == "sellDn": keep = r24 >= -2
     elif code == "sellUp": keep = -4 <= r24 <= 2
     else: keep = abs(r24) > 4 and dow != "Sat"
-    return dict(r24=None if r24 != r24 else round(r24, 2), trend=None if above is None else ("above" if above else "below"), dow=dow, keep=bool(keep))
+    rv_ = rvs.get(de, np.nan)
+    return dict(r24=None if r24 != r24 else round(r24, 2), trend=None if above is None else ("above" if above else "below"), dow=dow, keep=bool(keep), rv=None if rv_ != rv_ else round(float(rv_), 1))
 def wend(ed):
     d = datetime.fromisoformat(ed); return int((datetime(d.year, d.month, d.day, tzinfo=NY) + timedelta(days=1)).timestamp())
 
@@ -143,6 +145,18 @@ def keep_v2(r):
     if code == "sellUp": return r.dow != "Mon" and r.pct >= (4 if eth else 3)
     return True
 t["keep2"] = t.apply(keep_v2, axis=1)
+# filter v3 candidate (2026-11-28): v1's conditions with distance measured in typical moves. z = distance % / expected move over the
+# rule's standard horizon (carry 24h, sellDn 6h, sellUp 9h, buyT 18h), from the 30-day realized vol known at the start of the entry day.
+# carry z >= 2.5; sellDn z >= 3.5 and not Sunday; sellUp z >= 2.5 and not Monday; buyT unchanged. Same thresholds on both assets (c16).
+H3 = {"carry": 24, "sellDn": 6, "sellUp": 9, "buyT": 18}; Z3 = {"carry": 2.5, "sellDn": 3.5, "sellUp": 2.5}
+t["z"] = [round(p_ / (rv_ / np.sqrt(365) * np.sqrt(H3[c_.split()[1]] / 24)), 2) if rv_ is not None and rv_ == rv_ and rv_ > 0 else np.nan for p_, rv_, c_ in zip(t.pct, t.rv, t.cell)]
+def keep_v3(r):
+    code = r.cell.split()[1]
+    if not r.keep: return False
+    if code == "buyT": return True
+    if r.z != r.z or r.z < Z3[code]: return False
+    return not ((code == "sellDn" and r.dow == "Sun") or (code == "sellUp" and r.dow == "Mon"))
+t["keep3"] = t.apply(keep_v3, axis=1)
 res = t.dropna(subset=["pnl"])
 print(f"##### shadow review: {len(days)} event-days logged ({days[0]} .. {days[-1]}), cap ${a.cap:,.0f} per cell per day, taker paper\n")
 
@@ -213,11 +227,12 @@ if len(los):
 
 print("\n=== 6. filter v2 candidate (2026-11-27) next to v1: carry adds strike >= 6% away, no Mon/Tue; sellDn adds level >= 5% away, no Sun; "
       "sellUp adds no Mon and (ETH) level >= 4% away; buyT unchanged ===")
+print("       filter v3 candidate (2026-11-28) = v1 plus distance in typical moves: carry z >= 2.5; sellDn z >= 3.5, no Sun; sellUp z >= 2.5, no Mon; buyT unchanged")
 rows = []
 for cell in order + ["SELLING BOOK", "ALL"]:
     x = res if cell == "ALL" else res[~res.cell.str.endswith("buyT")] if cell == "SELLING BOOK" else res[res.cell == cell]
     r = dict(cell=cell)
-    for lab, m in (("all", np.ones(len(x), bool)), ("v1", x.keep.values), ("v2", x.keep2.values)):
+    for lab, m in (("all", np.ones(len(x), bool)), ("v1", x.keep.values), ("v2", x.keep2.values), ("v3", x.keep3.values)):
         y = x[m]; d = y.groupby("event").pnl.sum()
         r.update({f"{lab}_n": len(y), f"{lab}_loss": int((y.win == 0).sum()), f"{lab}_usd": round(y.usd.sum()), f"{lab}_pnl": round(y.pnl.sum()),
                   f"{lab}_roi": f"{y.pnl.sum()/y.usd.sum():+.1%}" if y.usd.sum() > 0 else "", f"{lab}_worst": round(d.min()) if len(d) else 0})
@@ -225,6 +240,10 @@ for cell in order + ["SELLING BOOK", "ALL"]:
 print(pd.DataFrame(rows).to_string(index=False))
 los2 = res[(res.win == 0) & res.keep2 & ~res.cell.str.endswith("buyT")]
 print(f"losing trades kept by v2: {len(los2)}" + ("" if los2.empty else "\n" + los2.assign(pnl=los2.pnl.round(0))[["cell", "event", "dow", "market", "entry", "pct", "vwap", "pnl", "r24", "trend"]].to_string(index=False)))
+los3 = res[(res.win == 0) & res.keep3 & ~res.cell.str.endswith("buyT")]
+print(f"losing trades kept by v3: {len(los3)}" + ("" if los3.empty else "\n" + los3.assign(pnl=los3.pnl.round(0))[["cell", "event", "dow", "market", "entry", "pct", "z", "rv", "vwap", "pnl", "r24", "trend"]].to_string(index=False)))
+sel = res[~res.cell.str.endswith("buyT")]
+if len(sel): print("selling trades by z (v1-kept only): " + "; ".join(f"{c_}: median z {x_.z.median():.1f}, {int((x_.z >= Z3[c_.split()[1]]).sum())}/{len(x_)} at or above the v3 floor" for c_, x_ in sel[sel.keep].groupby("cell")))
 
 pend = t[t.pnl.isna()]
 if len(pend): print("\npending (not yet resolved in the fills DBs):"); print(pend[["cell", "event", "market", "entry", "vwap", "usd"]].round(4).to_string(index=False))
