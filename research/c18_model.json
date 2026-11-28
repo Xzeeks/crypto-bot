@@ -1,0 +1,75 @@
+{
+ "fitted_on": "2020-02-01 .. 2026-11-27",
+ "trades": 62855,
+ "hours": {
+  "carry": 24,
+  "sellDn": 6,
+  "sellUp": 9
+ },
+ "safety": 1.75,
+ "kelly": 0.1,
+ "bankroll": 20000,
+ "day_cap": 0.1,
+ "trade_cap": 1500,
+ "inputs": "z = distance % / (30d realized vol % / sqrt(365) * sqrt(hours left / 24)); 24h fall/rise = min/max(24h move %, 0) / daily vol %; above 30d avg = 1 if the day's opening price is at or above its 30-day average; bitcoin = 1 for BTC; range so far = (day's high - low so far) / day's first price, in %, / daily vol %",
+ "rules": {
+  "carry": {
+   "features": [
+    "const",
+    "log z",
+    "24h fall",
+    "24h rise",
+    "above 30d avg",
+    "bitcoin"
+   ],
+   "coef": [
+    -2.3351608899222174,
+    -1.7763201220979317,
+    -0.5291638009657981,
+    0.2498098198526867,
+    -0.3329632190106891,
+    -0.09470359119202297
+   ]
+  },
+  "sellDn": {
+   "features": [
+    "const",
+    "log z",
+    "24h fall",
+    "24h rise",
+    "above 30d avg",
+    "bitcoin",
+    "range so far"
+   ],
+   "coef": [
+    -1.9600487814467291,
+    -2.3965305503773267,
+    -0.34261818035327374,
+    -0.4270001801222261,
+    -0.09225446318008951,
+    -0.023386365254922506,
+    0.5841182258926984
+   ]
+  },
+  "sellUp": {
+   "features": [
+    "const",
+    "log z",
+    "24h fall",
+    "24h rise",
+    "above 30d avg",
+    "bitcoin",
+    "range so far"
+   ],
+   "coef": [
+    -2.4476151397783377,
+    -2.499345378995899,
+    -0.22490732363237004,
+    0.40399067751231116,
+    0.29892331228488733,
+    -0.09541529110804153,
+    0.5644445520947619
+   ]
+  }
+ }
+}

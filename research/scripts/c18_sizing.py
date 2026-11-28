@@ -29,6 +29,7 @@ ap = argparse.ArgumentParser(); ap.add_argument("--data-dir", default="research/
 ap.add_argument("--bankroll", type=float, default=20000); ap.add_argument("--day-cap", type=float, default=0.10, help="largest loss in one day as a share of bankroll")
 ap.add_argument("--kelly", type=float, default=0.10, help="fraction of the Kelly share to stake"); ap.add_argument("--safety", type=float, default=1.75, help="multiplier on the predicted loss rate")
 ap.add_argument("--price-by", choices=["distance", "z"], default="distance", help="price each historical trade at the 2026 average for its distance in %% (default), or for its distance in typical moves (z) — a check that the result does not rest on the market ignoring volatility")
+ap.add_argument("--save-model", default=None, help="write the model (fitted on ALL years) and the sizing settings to this JSON file, for the shadow review. Only written when asked, so the frozen model is not overwritten by a later run.")
 ap.add_argument("--trade-cap", type=float, default=1500, help="largest stake on one trade ($)"); ap.add_argument("--fee-rate", type=float, default=0.01)
 a = ap.parse_args()
 P = lambda n: os.path.join(a.data_dir, n)
@@ -78,18 +79,27 @@ def feats(d, cell):
     names = ["const", "log z", "24h fall", "24h rise", "above 30d avg", "bitcoin"]
     if cell != "carry": cols.append(d.rngz.values); names.append("range so far")
     return np.column_stack(cols), names
-R["p"] = np.nan
+R["p"] = np.nan; MODEL = {}
 print("\n################ 1. LOSS-PROBABILITY MODEL (every prediction is for a year the model was not fitted on) ################")
 for cell in HOURS:
     idx = R.index[R.cell == cell]; d = R.loc[idx]; X, names = feats(d, cell); y = d.ev.values
     for yr in sorted(d.year.unique()):
         te = (d.year == yr).values; R.loc[idx[te], "p"] = 1 / (1 + np.exp(-(X[te] @ fit(X[~te], y[~te]))))
-    d = R.loc[idx]; b = fit(X, y)
+    d = R.loc[idx]; b = fit(X, y); MODEL[cell] = {"features": names, "coef": [float(v_) for v_ in b]}
     print(f"\n-- {cell}: {len(d):,} trades; effect of each input (log-odds; negative = safer): " + ", ".join(f"{n_} {v_:+.2f}" for n_, v_ in zip(names[1:], b[1:])))
     cal = d.assign(g=pd.qcut(d.p, 5, labels=["safest fifth", "2nd", "3rd", "4th", "riskiest fifth"])).groupby("g", observed=True).agg(trades=("ev", "size"), z=("z", "median"), predicted=("p", "mean"), actual=("ev", "mean"))
     cal[["predicted", "actual"]] = (cal[["predicted", "actual"]] * 100).round(2); cal["z"] = cal.z.round(2); print(cal.to_string())
     yr = d.groupby("year").agg(predicted=("p", "mean"), actual=("ev", "mean")); yr["actual / predicted"] = (yr.actual / yr.predicted).round(2)
     print("   by year, actual / predicted: " + ", ".join(f"{y_}: {v_}" for y_, v_ in yr["actual / predicted"].items()) + f"   (worst {yr['actual / predicted'].max()})")
+
+if a.save_model:
+    import json
+    with open(a.save_model, "w") as fh:
+        json.dump({"fitted_on": f"{R.D.min()} .. {R.D.max()}", "trades": int(len(R)), "hours": HOURS, "safety": a.safety, "kelly": a.kelly, "bankroll": a.bankroll, "day_cap": a.day_cap,
+                   "trade_cap": a.trade_cap, "inputs": "z = distance % / (30d realized vol % / sqrt(365) * sqrt(hours left / 24)); 24h fall/rise = min/max(24h move %, 0) / daily vol %; "
+                   "above 30d avg = 1 if the day's opening price is at or above its 30-day average; bitcoin = 1 for BTC; range so far = (day's high - low so far) / day's first price, in %, / daily vol %",
+                   "rules": MODEL}, fh, indent=1)
+    print(f"\nmodel and sizing settings written to {a.save_model}")
 
 # ---------- 2. cautious edge and Kelly share ----------
 R["be"] = 1 - R.price                                   # loss rate the price can afford

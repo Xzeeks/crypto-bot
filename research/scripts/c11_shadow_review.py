@@ -25,7 +25,9 @@ ap = argparse.ArgumentParser()
 ap.add_argument("db"); ap.add_argument("--data-dir", default="research/data"); ap.add_argument("--cap", type=float, default=5000)
 ap.add_argument("--trades", action="store_true", help="also print every individual trade")
 ap.add_argument("--fee-rate", type=float, default=0.01, help="Polymarket taker fee rate for these markets: fee = shares x rate x price x (1 - price). 0.01 = 'Crypto, all other markets' in the fee table as of 2026-11-28")
+ap.add_argument("--model", default="research/c18_model.json", help="frozen loss-probability model and sizing settings from c18_sizing.py --save-model (section 8)")
 a = ap.parse_args()
+MODEL = json.load(open(a.model)) if os.path.exists(a.model) else None
 
 CELLS = [
     dict(code="carry",  fam="above", side="yes", limit=0.975, hours=(12, 24), pct={"ethereum": (5, 8), "bitcoin": (4, 8)}, dirs=None),
@@ -52,6 +54,23 @@ def load_k(asset):
     dc = pd.Series({d: kk.get(int(datetime(d.year, d.month, d.day, tzinfo=NY).timestamp()), np.nan) for d in dl}).ffill()
     rv = np.log(dc).diff().rolling(30).std() * np.sqrt(365) * 100          # 30-day realized vol, annualized %, as known at the start of each day
     return kk, dc, dc.rolling(30).mean(), rv
+def load_range(asset, t_min):
+    """{minute: the New York day's range so far in %, (high so far - low so far) / the day's first price} from the 1m candles since t_min."""
+    parts = []
+    for n in (f"{PRE[asset]}_hit.duckdb", f"{PRE[asset]}_above.duckdb"):
+        p_ = os.path.join(a.data_dir, n)
+        if os.path.exists(p_):
+            d = duckdb.connect(p_, read_only=True); parts.append(d.execute(f"SELECT open_ts, high, low, close FROM klines WHERE open_ts >= {int(t_min) - 2 * 86400}").df()); d.close()
+    if not parts: return {}
+    k = pd.concat(parts).drop_duplicates("open_ts").sort_values("open_ts")
+    day = pd.to_datetime(k.open_ts, unit="s", utc=True).dt.tz_convert("America/New_York").dt.date; g = k.groupby(day.values)
+    rng = (g.high.cummax() - g.low.cummin()) / g.close.transform("first") * 100
+    return dict(zip(k.open_ts.values, rng.values))
+def predict_loss(code, asset, z, r24, above, sigd, rngz):
+    """Loss probability from the frozen model (c18). Inputs as described in the model file."""
+    m = MODEL["rules"][code]; v = {"const": 1.0, "log z": np.log(z), "24h fall": min(r24, 0) / sigd, "24h rise": max(r24, 0) / sigd, "above 30d avg": 1.0 if above else 0.0,
+                                   "bitcoin": 1.0 if asset == "bitcoin" else 0.0, "range so far": rngz}
+    return 1 / (1 + np.exp(-sum(c_ * v[f_] for f_, c_ in zip(m["features"], m["coef"]))))
 def tag(K, code, ts, event_date, spot):
     """Conditions known at entry, and whether filter v1 (fixed 2026-11-26) keeps the trade:
        carry: 24h move >= -2% AND price above its 30-day average;  sellDn: 24h move >= -2%;
@@ -97,9 +116,9 @@ def walk(r, side, limit, rem):
     return cost, shares
 
 con = sqlite3.connect(a.db)
-trades, makers, days_logged, strat = [], [], set(), []
+trades, makers, days_logged, strat, sized_cand = [], [], set(), [], []
 for asset in ("ethereum", "bitcoin"):
-    K = load_k(asset)
+    K = load_k(asset); RNG = None
     for fam in ("above", "hit"):
         path = os.path.join(a.data_dir, f"{PRE[asset]}_{fam}.duckdb")
         if not os.path.exists(path): print(f"missing {path} — skipping {asset} {fam}"); continue
@@ -169,6 +188,21 @@ for asset in ("ethereum", "bitcoin"):
                     strat.append(dict(strategy=sname, cell=name, asset=asset, code=c["code"], side=c["side"], hrs=round(r.hours, 2), rv=tg_["rv"], event=r.event_date, market=f"{r.direction}{r.strike:g}", entry=datetime.fromtimestamp(r.ts, NY).strftime("%m-%d %H:%M"),
                                       waited_min=round((r.ts - first_ts[k_]) / 60), pct=round(r.pct, 2), z=round(zscore(c["code"], r.pct, tg_["rv"]), 2), vwap=round(vw, 4), usd=cost, fee=fee, win=win,
                                       pnl=None if win is None else shares * win - cost, r24=tg_["r24"], trend=tg_["trend"], dow=tg_["dow"]))
+            # --- section 8: candidates for the sized strategy. Any snapshot in the rule's band and window where filter v1 passes and the best
+            # price leaves a positive cautious edge (price < 1 - safety x predicted loss). The fixed 0.975 limit is not used: the model sets the limit.
+            if MODEL and c["code"] in MODEL["rules"] and K is not None:
+                if RNG is None: RNG = load_range(asset, b.ts.min())
+                qa = q.assign(px=px_now.values); qa = qa[qa.px.notna() & (qa.px < 0.9995) & (qa.px > 0.5)].sort_values("ts")
+                for r in qa.itertuples():
+                    tg_ = tag(K, c["code"], r.ts, r.event_date, r.spot)
+                    if not tg_["keep"] or tg_["rv"] is None or r.hours <= 0: continue
+                    sigd = tg_["rv"] / np.sqrt(365); z_ = r.pct / (sigd * np.sqrt(r.hours / 24))
+                    rngz = 0.0 if c["code"] == "carry" else RNG.get((int(r.ts) // 60) * 60 - 60, np.nan) / sigd
+                    if z_ <= 0 or rngz != rngz: continue
+                    p_ = predict_loss(c["code"], asset, z_, tg_["r24"], tg_["trend"] == "above", sigd, rngz); L = MODEL["safety"] * p_
+                    if r.px >= 1 - L: continue
+                    sized_cand.append(dict(ts=int(r.ts), cell=name, asset=asset, code=c["code"], side=c["side"], event=r.event_date, direction=r.direction, strike=r.strike, pct=r.pct, hrs=r.hours, px=r.px,
+                                           p_hat=p_, L=L, z_left=z_, rngz=rngz, bids_json=r.bids_json, asks_json=r.asks_json, o=out.get((r.event_date, r.direction, float(r.strike))), tg=tg_))
             # maker ceiling
             w = q.groupby(KEYS).agg(t0=("ts", "min"), t1=("ts", "max")).reset_index()
             g = f.merge(w, on=KEYS); g = g[(g.ts >= g.t0) & (g.ts <= g.t1 + 120)]
@@ -318,6 +352,57 @@ if len(S7):
     d7 = R7.assign(net=R7.pnl - R7.fee).pivot_table(index="event", columns="strategy", values="net", aggfunc="sum").reindex(columns=["none", "v1", "v2", "v3"])
     ds = sb.assign(net=sb.pnl - sb.fee).pivot_table(index="event", columns="strategy", values="net", aggfunc="sum").reindex(columns=["none", "v1", "v2", "v3"])
     print("\nnet P&L by event-day — selling rules only | all rules:"); print(pd.concat({"selling": ds, "all": d7}, axis=1).round(0).to_string(na_rep=""))
+
+# ---------- 8. the sized strategy ----------
+if MODEL:
+    BANK, KF, TCAP, DCAP, SAFE = MODEL["bankroll"], MODEL["kelly"], MODEL["trade_cap"], MODEL["bankroll"] * MODEL["day_cap"], MODEL["safety"]
+    print(f"\n=== 8. SIZED STRATEGY (model frozen on {MODEL['fitted_on']}; days after that are out of sample) ===")
+    print(f"Enter at the first snapshot where filter v1 passes and the price leaves a cautious edge: price < 1 - {SAFE} x predicted loss rate. Stake = {KF} x Kelly share x ${BANK:,.0f},")
+    print(f"at most ${TCAP:,.0f} per trade, buying only book levels that still leave a cautious edge. One budget of ${DCAP:,.0f} per event-day across every rule and both assets, spent in time order.")
+    sized, seen, spent8 = [], set(), {}
+    for cnd in sorted(sized_cand, key=lambda x_: x_["ts"]):
+        k_ = (cnd["asset"], cnd["code"], cnd["event"], cnd["direction"], cnd["strike"])
+        if k_ in seen: continue
+        left = DCAP - spent8.get(cnd["event"], 0.0)
+        if left <= 1: continue                                    # the day's budget is used up; a later market may not enter either
+        seen.add(k_)
+        be = 1 - cnd["px"]; target = min(KF * BANK * (be - cnd["L"]) / be, TCAP, left)
+        r_ = argparse.Namespace(bids_json=cnd["bids_json"], asks_json=cnd["asks_json"])
+        cost, shares = walk(r_, cnd["side"], 1 - cnd["L"] - EPS, target)
+        if cost < 5: continue
+        spent8[cnd["event"]] = spent8.get(cnd["event"], 0.0) + cost
+        o = cnd["o"]; win = None if o is None else (o if cnd["side"] == "yes" else 1 - o); vw = cost / shares; tg_ = cnd["tg"]
+        sized.append(dict(strategy="sized", cell=cnd["cell"], asset=cnd["asset"], code=cnd["code"], side=cnd["side"], hrs=round(cnd["hrs"], 2), rv=tg_["rv"], event=cnd["event"],
+                          market=f"{cnd['direction']}{cnd['strike']:g}", entry=datetime.fromtimestamp(cnd["ts"], NY).strftime("%m-%d %H:%M"), waited_min=0, pct=round(cnd["pct"], 2),
+                          z=round(zscore(cnd["code"], cnd["pct"], tg_["rv"]), 2), vwap=round(vw, 4), usd=cost, fee=shares * a.fee_rate * vw * (1 - vw), win=win, pnl=None if win is None else shares * win - cost,
+                          r24=tg_["r24"], trend=tg_["trend"], dow=tg_["dow"], z_left=round(cnd["z_left"], 2), p_hat=cnd["p_hat"], cautious=cnd["L"], target=target))
+    S8 = pd.DataFrame(sized)
+    if S8.empty: print("no sized trades: no snapshot offered a cautious edge")
+    else:
+        R8 = S8.dropna(subset=["pnl"]); rows = []
+        for cell in [o_ for o_ in order if o_ in set(S8.cell)] + ["ALL SIZED"]:
+            x = R8 if cell == "ALL SIZED" else R8[R8.cell == cell]
+            if x.empty: continue
+            d = (x.pnl - x.fee).groupby(x.event).sum()
+            rows.append(dict(cell=cell, trades=len(x), losses=int((x.win == 0).sum()), staked=round(x.usd.sum()), avg_price=round(np.average(x.vwap, weights=x.usd), 4), price_affords=f"{(1 - np.average(x.vwap, weights=x.usd)):.2%}",
+                             predicted_loss=f"{np.average(x.p_hat, weights=x.usd):.2%}", cautious=f"{np.average(x.cautious, weights=x.usd):.2%}", pnl=round(x.pnl.sum()), fees=round(x.fee.sum()),
+                             net=round(x.pnl.sum() - x.fee.sum()), roi=f"{(x.pnl.sum() - x.fee.sum())/x.usd.sum():+.1%}", worst_day=round(d.min()), days=x.event.nunique()))
+        print(pd.DataFrame(rows).to_string(index=False))
+        d8 = (R8.pnl - R8.fee).groupby(R8.event).sum(); u8 = S8.groupby("event").usd.sum()
+        print(f"days traded {S8.event.nunique()} of {len(days)}; staked per traded day ${u8.mean():,.0f} (max ${u8.max():,.0f} against the ${DCAP:,.0f} budget); expected losses from the model {R8.p_hat.sum():.2f} of {len(R8)} trades, actual {int((R8.win == 0).sum())}")
+        if len(S7):
+            sb7 = S7.dropna(subset=["pnl"]); sb7 = sb7[~sb7.cell.str.endswith("buyT")]
+            cmp_ = [dict(book=("no filter" if l_ == "none" else l_) + ", flat up to the cap", trades=len(y_), losses=int((y_.win == 0).sum()), staked=round(y_.usd.sum()), net=round(y_.pnl.sum() - y_.fee.sum()),
+                         roi=f"{(y_.pnl.sum() - y_.fee.sum())/y_.usd.sum():+.1%}" if y_.usd.sum() > 0 else "") for l_ in ("none", "v1", "v2", "v3") for y_ in [sb7[sb7.strategy == l_]]]
+            cmp_.append(dict(book="sized (this section)", trades=len(R8), losses=int((R8.win == 0).sum()), staked=round(R8.usd.sum()), net=round(R8.pnl.sum() - R8.fee.sum()), roi=f"{(R8.pnl.sum() - R8.fee.sum())/R8.usd.sum():+.1%}"))
+            print("\nselling rules side by side (paper, taker, after fees):"); print(pd.DataFrame(cmp_).to_string(index=False))
+        print("\nnet P&L and stake by event-day:"); print(pd.DataFrame({"net": d8.round(0), "staked": u8.round(0), "trades": S8.groupby("event").size()}).to_string(na_rep=""))
+        show8 = S8.assign(usd=S8.usd.round(0), target=S8.target.round(0), net=(S8.pnl - S8.fee).round(0), p_hat=(S8.p_hat * 100).round(2), cautious=(S8.cautious * 100).round(2), afford=((1 - S8.vwap) * 100).round(2))
+        print("\nevery sized trade (predicted loss %, cautious loss %, what the price affords %):")
+        print(show8[["cell", "event", "dow", "market", "entry", "hrs", "pct", "z_left", "r24", "p_hat", "cautious", "afford", "vwap", "target", "usd", "win", "net"]].to_string(index=False))
+        if len(S7): pd.concat([S7, S8[[c_ for c_ in S7.columns if c_ in S8.columns]]], ignore_index=True).to_pickle(os.path.join(a.data_dir, "c11_trades.pkl"))
+else:
+    print(f"\n(section 8 skipped: no model file at {a.model} — run c18_sizing.py --save-model {a.model})")
 
 pend = t[t.pnl.isna()]
 if len(pend): print("\npending (not yet resolved in the fills DBs):"); print(pend[["cell", "event", "market", "entry", "vwap", "usd"]].round(4).to_string(index=False))

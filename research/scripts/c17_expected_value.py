@@ -69,13 +69,13 @@ def summarise(x, lab):
             "worst-yr%": round(w(x, "worst") * 100, 2), "margin pts": round((w(x, "be") - w(x, "hist")) * 100 * (1 if sell else -1), 2), "EV/$ %": round(w(x, "ev") * 100, 2), "EV/$ worst-yr %": round(w(x, "evw") * 100, 2),
             "expected $": round((x.usd * x.ev).sum()), "expected $ worst-yr": round((x.usd * x.evw).sum()), "paper $": round(x.paper.sum()), "comparable n (median)": int(x.n.median())}
 order = [c for c in ["ETH carry", "BTC carry", "ETH sellDn", "BTC sellDn", "ETH sellUp", "BTC sellUp", "ETH buyT", "BTC buyT"] if c in set(E.cell)]
-for s_ in ("none", "v1", "v2", "v3"):
+for s_ in ("none", "v1", "v2", "v3", "sized"):
     x = E[E.strategy == s_]
     if x.empty: continue
     out = [summarise(x[x.cell == c], c) for c in order if (x.cell == c).any()]
     sb = x[x.code != "buyT"]
     if len(sb): out.append(summarise(sb, "SELLING BOOK"))
-    print(f"\n================ strategy: {'no filter' if s_ == 'none' else s_} ================")
+    print(f"\n================ strategy: {'no filter' if s_ == 'none' else ('sized (model + Kelly fraction + day budget; a check from history that does not use the model)' if s_ == 'sized' else s_)} ================")
     print("(for buyT: break-even% is the hit rate the price needs, hist% the hit rate history gives, worst-yr% the lowest year; margin = hist - break-even)")
     print(pd.DataFrame(out).to_string(index=False))
 print("\n-- how the historical match was made (share of trades by step) --")
