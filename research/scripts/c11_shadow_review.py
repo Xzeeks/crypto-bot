@@ -166,7 +166,7 @@ for asset in ("ethereum", "bitcoin"):
                     spent7[r.event_date] = spent7.get(r.event_date, 0.0) + cost
                     o = out.get((r.event_date, r.direction, float(r.strike))); win = None if o is None else (o if c["side"] == "yes" else 1 - o)
                     vw = cost / shares; fee = shares * a.fee_rate * vw * (1 - vw)
-                    strat.append(dict(strategy=sname, cell=name, event=r.event_date, market=f"{r.direction}{r.strike:g}", entry=datetime.fromtimestamp(r.ts, NY).strftime("%m-%d %H:%M"),
+                    strat.append(dict(strategy=sname, cell=name, asset=asset, code=c["code"], side=c["side"], hrs=round(r.hours, 2), rv=tg_["rv"], event=r.event_date, market=f"{r.direction}{r.strike:g}", entry=datetime.fromtimestamp(r.ts, NY).strftime("%m-%d %H:%M"),
                                       waited_min=round((r.ts - first_ts[k_]) / 60), pct=round(r.pct, 2), z=round(zscore(c["code"], r.pct, tg_["rv"]), 2), vwap=round(vw, 4), usd=cost, fee=fee, win=win,
                                       pnl=None if win is None else shares * win - cost, r24=tg_["r24"], trend=tg_["trend"], dow=tg_["dow"]))
             # maker ceiling
@@ -298,6 +298,7 @@ print("snapshot that would pass, and the daily cap is spent on trades the filter
 print(f"has the whole ${a.cap:,.0f} cap per cell per day to itself. 'fees' = taker fee at rate {a.fee_rate} (shares x rate x price x (1 - price)); 'net' = pnl - fees.")
 S7 = pd.DataFrame(strat)
 if len(S7):
+    S7.to_pickle(os.path.join(a.data_dir, "c11_trades.pkl"))      # every paper trade of every strategy, for c17_expected_value.py
     R7 = S7.dropna(subset=["pnl"]); rows = []
     for cell in order + ["SELLING BOOK", "ALL"]:
         x = R7 if cell == "ALL" else R7[~R7.cell.str.endswith("buyT")] if cell == "SELLING BOOK" else R7[R7.cell == cell]
