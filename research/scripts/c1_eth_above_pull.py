@@ -154,6 +154,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-fills", action="store_true")
     ap.add_argument("--skip-klines", action="store_true")
+    ap.add_argument("--refresh-days", type=int, default=45, help="refetch fills of markets stored before pulls were tracked if they resolved within this many days")
     a = ap.parse_args()
     symbol = "ETHUSDT" if a.asset == "ethereum" else "BTCUSDT"
 
@@ -185,18 +186,41 @@ def main():
     print(f"events={n_ev} markets={n_mk}")
 
     if not a.skip_fills:
-        done = {r[0] for r in con.execute("SELECT DISTINCT condition_id FROM fills").fetchall()}
-        todo = con.execute("SELECT condition_id, question FROM markets WHERE condition_id IS NOT NULL").fetchall()
-        for i, (cid, q) in enumerate(todo, 1):
-            if cid in done:
+        # A market is refetched until it has been pulled once AFTER it ended. The old rule ("has any fills -> skip") left a market
+        # truncated for good if it was first pulled while still trading. `pulls` records when each market was fetched and whether
+        # that fetch was after its end. Markets stored before `pulls` existed are refetched if they ended within --refresh-days.
+        con.execute("CREATE TABLE IF NOT EXISTS pulls(condition_id TEXT PRIMARY KEY, pulled_ts BIGINT, complete BOOLEAN)")
+        now = int(time.time())
+        stored = dict(con.execute("SELECT condition_id, COUNT(*) FROM fills GROUP BY 1").fetchall())
+        pulled = dict(con.execute("SELECT condition_id, complete FROM pulls").fetchall())
+        todo = con.execute("SELECT condition_id, question, resolve_ts FROM markets WHERE condition_id IS NOT NULL").fetchall()
+        n_new = n_re = n_kept = 0
+        for i, (cid, q, end) in enumerate(todo, 1):
+            if pulled.get(cid):
+                continue                                                                    # fetched after it resolved: complete
+            if cid in stored and cid not in pulled and end < now - a.refresh_days * 86400:
+                continue                                                                    # old, stored before tracking
+            try:
+                fl = fetch_fills(cid)
+            except requests.HTTPError as e:
+                print(f"[{i}/{len(todo)}] {q[:48]:48s} fetch failed ({e.response.status_code if e.response is not None else '?'}), stored fills kept", flush=True)
                 continue
-            fl = fetch_fills(cid)
-            if fl:
-                con.executemany("INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                [(f["condition_id"], f["ts"], f["price"], f["size"], f["side"], f["token"],
-                                  f["outcome_label"], f["outcome_index"], f["wallet"], f["tx"]) for f in fl])
-            print(f"[{i}/{len(todo)}] {q[:48]:48s} fills={len(fl)}", flush=True)
+            had = stored.get(cid, 0)
+            if len(fl) >= had:
+                con.execute("BEGIN")
+                con.execute("DELETE FROM fills WHERE condition_id = ?", [cid])
+                if fl:
+                    con.executemany("INSERT INTO fills VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                    [(f["condition_id"], f["ts"], f["price"], f["size"], f["side"], f["token"],
+                                      f["outcome_label"], f["outcome_index"], f["wallet"], f["tx"]) for f in fl])
+                con.execute("INSERT OR REPLACE INTO pulls VALUES (?,?,?)", [cid, now, bool(end + 7200 < now)])
+                con.execute("COMMIT")
+                n_re += had > 0; n_new += had == 0
+            else:
+                n_kept += 1                                                                 # the API returned fewer than we hold: keep ours
+            print(f"[{i}/{len(todo)}] {q[:48]:48s} fills={len(fl)}" + (f" (was {had})" if had else ""), flush=True)
             time.sleep(0.2)
+        print(f"fills: {n_new} markets fetched for the first time, {n_re} refetched, {n_kept} left as stored (API returned fewer)")
 
     if not a.skip_klines:
         lo, hi = con.execute("SELECT MIN(resolve_ts) - 10*86400, MAX(resolve_ts) + 3600 FROM markets").fetchone()
@@ -205,8 +229,9 @@ def main():
         for s, e in ranges:
             if s < e:
                 kl = fetch_klines(symbol, s, e)
-                con.executemany("INSERT OR REPLACE INTO klines VALUES (?,?,?,?,?,?)",
-                                [(k["open_ts"], k["open"], k["high"], k["low"], k["close"], k["volume"]) for k in kl])
+                if kl:
+                    con.executemany("INSERT OR REPLACE INTO klines VALUES (?,?,?,?,?,?)",
+                                    [(k["open_ts"], k["open"], k["high"], k["low"], k["close"], k["volume"]) for k in kl])
                 print(f"klines +{len(kl)}")
 
     # Cross-check resolution rule vs Polymarket outcome
