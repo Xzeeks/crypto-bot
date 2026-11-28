@@ -166,8 +166,8 @@ for cell in CELLS:
         for era in ("unseen", "seen"):
             e = t[t.era == era]
             if not len(e): continue
-            by = e.groupby("dow").ev.mean() * 100; rank = by.rank(ascending=not SELL[cell])      # rank 7 = worst day for the rule
-            print(f"   {era}: " + ", ".join(f"{d_} is #{int(len(by) + 1 - rank[d_])} worst of {len(by)}" for d_ in extra["skip"] if d_ in by))
+            by = e.groupby("dow").ev.mean() * 100; rank = by.rank(ascending=not SELL[cell], method="min")      # rank 1 = worst day for the rule
+            print(f"   {era}: " + ", ".join(f"{d_} is the #{int(rank[d_])} worst day of {len(by)}" for d_ in extra["skip"] if d_ in by))
 
 # ---------- C. selling book ----------
 sellc = [c for c in ("carry", "sellDn", "sellUp") if c in CELLS]
