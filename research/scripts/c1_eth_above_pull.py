@@ -154,6 +154,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-fills", action="store_true")
     ap.add_argument("--skip-klines", action="store_true")
+    ap.add_argument("--refresh-klines-days", type=int, default=0, help="re-download the last N days of 1m candles (repairs half-formed candles stored by earlier pulls)")
     ap.add_argument("--refresh-days", type=int, default=45, help="refetch fills of markets stored before pulls were tracked if they resolved within this many days")
     a = ap.parse_args()
     symbol = "ETHUSDT" if a.asset == "ethereum" else "BTCUSDT"
@@ -234,10 +235,15 @@ def main():
     if not a.skip_klines:
         lo, hi = con.execute("SELECT MIN(resolve_ts) - 10*86400, MAX(resolve_ts) + 3600 FROM markets").fetchone()
         have_lo, have_hi = con.execute("SELECT MIN(open_ts), MAX(open_ts) FROM klines").fetchone()
-        ranges = [(lo, hi)] if have_lo is None else [(lo, have_lo - 60), (have_hi + 60, hi)]   # backfill older gap + extend forward
+        # Extend forward FROM the last stored candle, not after it: that candle was usually still forming when it was stored.
+        # Candles whose minute has not finished yet are never stored.
+        ranges = [(lo, hi)] if have_lo is None else [(lo, have_lo - 60), (have_hi, hi)]
+        if a.refresh_klines_days and have_hi is not None:
+            ranges.append((int(time.time()) - a.refresh_klines_days * 86400, have_hi))
+        closed_before = int(time.time()) - 60
         for s, e in ranges:
             if s < e:
-                kl = fetch_klines(symbol, s, e)
+                kl = [k for k in fetch_klines(symbol, s, e) if k["open_ts"] <= closed_before]
                 if kl:
                     con.executemany("INSERT OR REPLACE INTO klines VALUES (?,?,?,?,?,?)",
                                     [(k["open_ts"], k["open"], k["high"], k["low"], k["close"], k["volume"]) for k in kl])

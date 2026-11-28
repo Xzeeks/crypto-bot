@@ -33,6 +33,9 @@ SQL
   ssh "$HOST" "gzip -9 -f /tmp/books_inc.sqlite && ls -lh /tmp/books_inc.sqlite.gz"
   rsync --partial --progress "$HOST:/tmp/books_inc.sqlite.gz" research/data/
   gunzip -f research/data/books_inc.sqlite.gz
+  # logger v3 added markets.gone_ts: make sure both sides have it before the merge (harmless if already there)
+  sqlite3 "$LOCAL" "ALTER TABLE markets ADD COLUMN gone_ts INTEGER" 2>/dev/null || true
+  sqlite3 research/data/books_inc.sqlite "ALTER TABLE markets ADD COLUMN gone_ts INTEGER" 2>/dev/null || true
   sqlite3 "$LOCAL" <<SQL
 ATTACH 'research/data/books_inc.sqlite' AS inc;
 BEGIN;

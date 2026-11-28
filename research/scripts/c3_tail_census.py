@@ -31,6 +31,7 @@ ap.add_argument("--years", type=float, default=3.0)
 ap.add_argument("--out", required=True)
 ap.add_argument("--step-pct", type=float, default=4.0, help="strike grid step as %% of spot (ETH ~4, BTC ~2.4)")
 ap.add_argument("--skip-pull", action="store_true")
+ap.add_argument("--pull-only", action="store_true", help="update the candles and stop (no census)")
 a = ap.parse_args()
 
 con = duckdb.connect(a.out)
@@ -41,7 +42,7 @@ if not a.skip_pull:
     end_ts = int(time.time()) // 60 * 60
     start_ts = end_ts - int(a.years * 365.25 * 86400)
     have = con.execute("SELECT MAX(open_ts) FROM klines").fetchone()[0]
-    cur = (max(start_ts, have + 60) if have else start_ts) * 1000
+    cur = (max(start_ts, have) if have else start_ts) * 1000      # refetch the last stored candle: it was usually still forming when stored
     n = 0
     while cur < end_ts * 1000:
         for i in range(5):
@@ -53,12 +54,13 @@ if not a.skip_pull:
                 if i == 4: raise
                 time.sleep(2 + 2 * i)
         if not b: break
-        con.executemany("INSERT OR REPLACE INTO klines VALUES (?,?,?,?,?,?)",
-                        [(k[0] // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])) for k in b])
+        rows_ = [(k[0] // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])) for k in b if k[0] // 1000 <= end_ts - 60]      # finished minutes only
+        if rows_: con.executemany("INSERT OR REPLACE INTO klines VALUES (?,?,?,?,?,?)", rows_)
         n += len(b); cur = b[-1][0] + 60_000
         if n % 50000 < 1000: print(f"  klines {n:,} up to {datetime.fromtimestamp(cur/1000, timezone.utc):%Y-%m-%d}", flush=True)
         if len(b) < 1000: break
     print(f"pulled {n:,} new klines")
+if a.pull_only: raise SystemExit(0)
 
 kl = con.execute("SELECT open_ts, close FROM klines ORDER BY open_ts").df().set_index("open_ts")["close"]
 print(f"klines: {len(kl):,} rows, {datetime.fromtimestamp(kl.index[0], timezone.utc):%Y-%m-%d} .. {datetime.fromtimestamp(kl.index[-1], timezone.utc):%Y-%m-%d}")

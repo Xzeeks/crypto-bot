@@ -172,7 +172,18 @@ for fam, path, endcol in (("hit", a.hit, "window_end"), ("above", a.above, "reso
     print(f"      markets whose end is not {'midnight' if fam == 'hit' else 'noon'} New York time: {len(badend)}" + ("" if badend.empty else " on " + ", ".join(sorted(badend.event_date.unique())[:6])))
     ok = short.empty and unres.empty and early.empty and badend.empty and has_pulls
     note(f"G {fam} trades", ok, "complete" if ok else f"{len(short)} markets short of trades, {len(unres)} unresolved, {len(early)} fetched early, {len(badend)} wrong end time" + ("" if has_pulls else ", no pulls table"))
-    if gaps: note(f"G {fam} days", len(gaps) == 0, f"{len(gaps)} event-days absent ({gaps[0]} .. {gaps[-1]}) — re-run the pull; days Polymarket never listed will stay absent")
+    recent = [g_ for g_ in gaps if (datetime.now(NY).date() - g_).days <= 45]
+    if recent: note(f"G {fam} days", False, f"{len(recent)} recent event-days absent ({recent[0]} .. {recent[-1]}) — re-run the pull")
+    elif gaps: print(f"      (older absent days are retried by every pull; if they stay absent Polymarket did not list them)")
+# the same 1m candle must be identical in both trade databases (a half-formed candle stored at pull time would differ)
+if a.hit and a.above:
+    d1 = duckdb.connect(a.hit, read_only=True); k1 = d1.execute("SELECT open_ts, high, low, close FROM klines").df(); d1.close()
+    d2 = duckdb.connect(a.above, read_only=True); k2 = d2.execute("SELECT open_ts, high, low, close FROM klines").df(); d2.close()
+    j = k1.merge(k2, on="open_ts", suffixes=("", "_2")); dif = j[(j.close != j.close_2) | (j.high != j.high_2) | (j.low != j.low_2)]
+    gk = np.diff(np.sort(k2.open_ts.values)); holes = int((gk > 60).sum())
+    print(f"candles: {len(j):,} minutes present in both trade databases, {len(dif)} differ; gaps in the close-ladder candles: {holes}")
+    if len(dif): print("      differing minutes (NY): " + ", ".join(fmt(t) for t in dif.open_ts.head(12)))
+    note("G candles", len(dif) == 0 and holes == 0, f"{len(dif)} minutes differ between databases, {holes} gaps")
 # logger side: a close-ladder market must be logged up to its print (a stray 404 from the exchange would stop it early, for good)
 ab_ = b[b.family == "above"]
 if len(ab_):
