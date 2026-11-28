@@ -169,6 +169,15 @@ def main():
 
     today = datetime.now(timezone.utc).date()
     dates = [today + timedelta(days=1) - timedelta(days=i) for i in range(a.days + 2)]  # include tomorrow's open event
+    # Also re-list any earlier date the --days window no longer reaches but that still needs it: an event whose markets have
+    # no outcome yet (first listed while open, never refreshed), and calendar days missing between the first event and today.
+    known = {r[0] for r in con.execute("SELECT DISTINCT event_date FROM markets").fetchall()}
+    stale = {r[0] for r in con.execute("SELECT DISTINCT event_date FROM markets WHERE outcome IS NULL AND resolve_ts < ?", [int(time.time()) - 6 * 3600]).fetchall()}
+    gaps = {min(known) + timedelta(days=i) for i in range((today - min(known)).days)} - known if known else set()
+    extra = sorted((stale | gaps) - set(dates))
+    if extra:
+        print(f"also re-listing {len(extra)} earlier date(s): {len(stale - set(dates))} unresolved, {len(gaps - set(dates))} missing", flush=True)
+        dates += extra
     n_ev = n_mk = 0
     for d in dates:
         ev = fetch_event(a.asset, d)

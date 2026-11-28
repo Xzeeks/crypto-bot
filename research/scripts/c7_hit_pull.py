@@ -95,11 +95,22 @@ def main():
 
     today = datetime.now(timezone.utc).date()
     n_ev = 0
-    for i in range(a.days + 2):
-        d = today + timedelta(days=1) - timedelta(days=i)
+    dates = [today + timedelta(days=1) - timedelta(days=i) for i in range(a.days + 2)]
+    # Also re-list earlier dates the --days window no longer reaches but that still need it (unresolved markets, missing days,
+    # and windows stored with a fixed 24h length, which is an hour off on the two clock-change days of the year).
+    known = {r[0] for r in con.execute("SELECT DISTINCT event_date FROM markets").fetchall()}
+    stale = {r[0] for r in con.execute("SELECT DISTINCT event_date FROM markets WHERE outcome IS NULL AND window_end < ?", [int(time.time()) - 6 * 3600]).fetchall()}
+    gaps = {min(known) + timedelta(days=i) for i in range((today - min(known)).days)} - known if known else set()
+    offhr = {ed for ed, we in con.execute("SELECT DISTINCT event_date, window_end FROM markets").fetchall() if datetime.fromtimestamp(we, NY).hour != 0}
+    extra = sorted((stale | gaps | offhr) - set(dates))
+    if extra:
+        print(f"also re-listing {len(extra)} earlier date(s): {len(stale - set(dates))} unresolved, {len(gaps - set(dates))} missing, {len(offhr - set(dates))} with a wrong window end", flush=True)
+        dates += extra
+    for d in dates:
         ev = get(f"{GAMMA}/events", {"slug": f"what-price-will-{a.asset}-hit-on-{d.strftime('%B').lower()}-{d.day}-{d.year}"})
         if not ev: continue
-        day0 = int(datetime(d.year, d.month, d.day, tzinfo=NY).timestamp()); day1 = day0 + 86400
+        day0 = int(datetime(d.year, d.month, d.day, tzinfo=NY).timestamp())
+        day1 = int((datetime(d.year, d.month, d.day, tzinfo=NY) + timedelta(days=1)).timestamp())      # next NY midnight (23h or 25h later on clock-change days)
         rows = []
         for m in ev[0].get("markets", []):
             po = parse(m)

@@ -139,5 +139,49 @@ for fam, path in (("hit", a.hit), ("above", a.above)):
           f"(positive = print worse for the taker than the logged quote)")
     note(f"F {fam} prints", len(matched) / len(f) > 0.9 and w3 > 0.85, f"{len(matched)/len(f):.0%} of prints have a book, {w1:.0%} within 1c, {w3:.0%} within 3c")
 
+# ---------- G. trade databases: are the stored trades and outcomes complete? ----------
+print("\n=== G. trade databases (completeness of stored trades, outcomes and listings) ===")
+import time as _time
+_now = int(_time.time())
+for fam, path, endcol in (("hit", a.hit, "window_end"), ("above", a.above, "resolve_ts")):
+    if not path: continue
+    d = duckdb.connect(path, read_only=True)
+    v = d.execute(f"""SELECT m.condition_id, CAST(m.event_date AS VARCHAR) AS event_date, m.question, m.volume AS vol, m.outcome, m.closed, m.{endcol} AS end_ts,
+                             COUNT(f.ts) AS n, COALESCE(SUM(f.size), 0) AS shares FROM markets m LEFT JOIN fills f USING (condition_id) GROUP BY ALL""").df()
+    has_pulls = d.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'pulls'").fetchone()[0] > 0
+    pl = d.execute("SELECT condition_id, complete FROM pulls").df() if has_pulls else pd.DataFrame(columns=["condition_id", "complete"])
+    d.close()
+    ended = v[v.end_ts < _now - 6 * 3600]
+    # 1. Polymarket's listed volume is in shares, and taker trades cover all of it, so shares stored / listed volume should be 1.00
+    e = ended[ended.vol >= 50].assign(r=lambda x: x.shares / x.vol); short = e[e.r < 0.97]
+    miss = (short.vol - short.shares).sum() / max(e.vol.sum(), 1)
+    # 2. markets that ended but were never re-listed afterwards (no outcome, stale volume -> check 1 cannot see them)
+    unres = ended[ended.outcome.isna() | ~ended.closed.astype(bool)]
+    # 3. markets that ended but whose trades were last fetched while they were still trading
+    early = ended.merge(pl, on="condition_id", how="left"); early = early[early.complete.notna() & ~early.complete.astype(bool)]
+    # 4. calendar days with no event between the first and the last
+    days = pd.to_datetime(v.event_date).dt.date; gaps = sorted(set(pd.date_range(days.min(), days.max()).date) - set(days))
+    # 5. window end is midnight (hit) / noon (above) New York time
+    want = 0 if fam == "hit" else 12
+    badend = v[[datetime.fromtimestamp(int(t), NY).hour != want for t in v.end_ts]]
+    print(f"{fam:5s} {len(v):,} markets on {days.nunique()} event-days, {int(v.n.sum()):,} trades; ended markets with volume: {len(e):,}, shares stored / listed volume median {e.r.median():.3f}, lowest {e.r.min():.3f}")
+    print(f"      trades missing (ratio < 0.97): {len(short)} markets on {short.event_date.nunique()} days = {miss:.2%} of all shares" + ("" if short.empty else "; days: " + ", ".join(sorted(short.event_date.unique())[:10])))
+    print(f"      ended without an outcome / still marked open: {len(unres)} markets" + ("" if unres.empty else " on " + ", ".join(sorted(unres.event_date.unique())[:10])))
+    print(f"      ended but trades last fetched before the end: {len(early)} markets" + ("" if early.empty else " on " + ", ".join(sorted(early.event_date.unique())[:10])) + ("" if has_pulls else "  (no pulls table yet — run the pull script once)"))
+    print(f"      event-days missing between first and last: {len(gaps)}" + ("" if not gaps else ": " + ", ".join(str(x) for x in gaps[:12])))
+    print(f"      markets whose end is not {'midnight' if fam == 'hit' else 'noon'} New York time: {len(badend)}" + ("" if badend.empty else " on " + ", ".join(sorted(badend.event_date.unique())[:6])))
+    ok = short.empty and unres.empty and early.empty and badend.empty and has_pulls
+    note(f"G {fam} trades", ok, "complete" if ok else f"{len(short)} markets short of trades, {len(unres)} unresolved, {len(early)} fetched early, {len(badend)} wrong end time" + ("" if has_pulls else ", no pulls table"))
+    if gaps: note(f"G {fam} days", len(gaps) == 0, f"{len(gaps)} event-days absent ({gaps[0]} .. {gaps[-1]}) — re-run the pull; days Polymarket never listed will stay absent")
+# logger side: a close-ladder market must be logged up to its print (a stray 404 from the exchange would stop it early, for good)
+ab_ = b[b.family == "above"]
+if len(ab_):
+    lastrow = ab_.groupby(["event_date", "strike"]).agg(last=("ts", "max"), rts=("resolve_ts", "first"), n=("ts", "size"), first=("ts", "min")).reset_index()
+    done = lastrow[lastrow.rts < b.ts.max() - 600]; stopped = done[done["last"] < done.rts - 300]
+    exp = ((lastrow["last"] - lastrow["first"]) // 120 + 1); thin = lastrow[(lastrow.n < 0.98 * exp) & (exp > 50)]
+    print(f"logger close ladder: {len(done)} finished markets, logging stopped more than 5 min before the print on {len(stopped)}; markets missing more than 2% of their snapshots: {len(thin)}")
+    if len(stopped): print(stopped.assign(stopped_at=stopped["last"].map(fmt), print_at=stopped.rts.map(fmt))[["event_date", "strike", "stopped_at", "print_at"]].head(10).to_string(index=False))
+    note("G logger to print", stopped.empty and thin.empty, f"{len(stopped)} markets stopped early, {len(thin)} thin")
+
 print("\n=== verdict ===")
 for n, s, msg in verdict: print(f"{s} {n:18s} {msg}")
